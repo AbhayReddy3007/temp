@@ -735,7 +735,7 @@ def create_ppt(title, points, filename="output.pptx", title_size=30, text_size=2
 
 # ---------------- STREAMLIT UI ----------------
 st.set_page_config(page_title="AI PPT Generator", layout="wide")
-st.title("🧠 AI PPT Generator — Improved Comparison Slides")
+st.title("PPT Generator")
 
 # session defaults
 _defaults = {
