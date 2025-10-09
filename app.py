@@ -4,10 +4,11 @@ import streamlit as st
 from pptx import Presentation
 from pptx.util import Pt, Inches
 from pptx.dml.color import RGBColor
-from pptx.enum.text import PP_ALIGN, MSO_AUTO_SIZE, MSO_VERTICAL_ANCHOR
+from pptx.enum.text import PP_ALIGN
+from io import BytesIO
 
 # ---------------- CONFIG ----------------
-GEMINI_API_KEY = "AIzaSyBtah4ZmuiVkSrJABE8wIjiEgunGXAbT3Q"  # 🔑 Add or use st.secrets["GEMINI_API_KEY"]
+GEMINI_API_KEY = "AIzaSyBtah4ZmuiVkSrJABE8wIjiEgunGXAbT3Q"
 TEXT_MODEL_NAME = "gemini-2.0-flash"
 
 # ---------------- GEMINI HELPERS ----------------
@@ -23,7 +24,7 @@ def call_gemini(prompt: str) -> str:
         return f"⚠️ Gemini API error: {e}"
 
 def generate_title(summary: str) -> str:
-    prompt = f"Generate a short and professional PowerPoint title (under 10 words) for this summary:\n{summary}"
+    prompt = f"Generate a short, clear PowerPoint title (under 10 words) for this summary:\n{summary}"
     return call_gemini(prompt).strip()
 
 def extract_slide_count(description: str, default=None):
@@ -63,11 +64,9 @@ def parse_points(points_text: str):
 def generate_outline(description: str):
     num_slides = extract_slide_count(description, default=None)
     if num_slides:
-        prompt = f"""Create a PowerPoint outline on: {description}.
-Generate exactly {num_slides} content slides (excluding title slide)."""
+        prompt = f"Create a PowerPoint outline on: {description}. Generate {num_slides} slides."
     else:
-        prompt = f"""Create a PowerPoint outline on: {description}.
-Each slide should have a title and 3–4 bullet points."""
+        prompt = f"Create a PowerPoint outline on: {description}. Each slide should have 3–4 bullet points."
     outline_text = call_gemini(prompt)
     return parse_points(outline_text)
 
@@ -75,14 +74,7 @@ def edit_outline_with_feedback(outline, feedback: str):
     outline_text = "\n".join(
         [f"Slide {i+1}: {s['title']}\n{s['description']}" for i, s in enumerate(outline['slides'])]
     )
-    prompt = f"""
-You are refining a PowerPoint outline based on feedback.
-Current Outline:
-{outline_text}
-
-Feedback:
-{feedback}
-"""
+    prompt = f"Refine the outline below based on feedback.\nOutline:\n{outline_text}\nFeedback:\n{feedback}"
     updated_points = parse_points(call_gemini(prompt))
     return {"title": outline['title'], "slides": updated_points}
 
@@ -101,12 +93,9 @@ def summarize_long_text(full_text: str) -> str:
         return ""
     chunks = split_text(full_text, 8000, 400)
     if len(chunks) <= 1:
-        return call_gemini(f"Summarize the following document in detail:\n{full_text}")
-    analyses = []
-    for idx, ch in enumerate(chunks, start=1):
-        analyses.append(call_gemini(f"Analyze CHUNK {idx}:\n{ch}"))
-    combined = "\n\n".join(analyses)
-    return call_gemini(f"Combine these analyses into a complete, detailed summary:\n{combined}")
+        return call_gemini(f"Summarize in detail:\n{full_text}")
+    analyses = [call_gemini(f"Analyze CHUNK {i}:\n{ch}") for i, ch in enumerate(chunks, 1)]
+    return call_gemini("Combine these analyses into a detailed summary:\n" + "\n\n".join(analyses))
 
 # ---------------- FILE UTILS ----------------
 def extract_text(path: str, filename: str) -> str:
@@ -137,65 +126,76 @@ def hex_to_rgb(hex_color: str):
 # ---------------- PPT GENERATOR ----------------
 def create_ppt(title, points, filename="output.pptx", title_size=30, text_size=22,
                font="Calibri", title_color="#5E2A84", text_color="#282828",
-               background_color="#FFFFFF", template_path=None):
-    """Create PPT using optional template."""
-    if template_path and os.path.exists(template_path):
-        prs = Presentation(template_path)
-        for _ in range(len(prs.slides)):
-            xml_slides = prs.slides._sldIdLst
-            slide_id = xml_slides[0]
-            xml_slides.remove(slide_id)
-    else:
-        prs = Presentation()
-
+               background_color="#FFFFFF", theme="Custom",
+               bg_title_path=None, bg_slide_path=None):
+    prs = Presentation()
     title = clean_title_text(title)
 
+    # Helper: add background image
+    def set_bg(slide, image_path):
+        if not image_path:
+            fill = slide.background.fill
+            fill.solid()
+            fill.fore_color.rgb = hex_to_rgb(background_color)
+            return
+        slide.shapes.add_picture(image_path, 0, 0, width=prs.slide_width, height=prs.slide_height)
+
     # Title Slide
-    slide_layout = prs.slide_layouts[0] if template_path else prs.slide_layouts[5]
-    slide = prs.slides.add_slide(slide_layout)
-    try:
-        slide.shapes.title.text = title
-    except Exception:
-        tb = slide.shapes.add_textbox(Inches(1), Inches(2), Inches(8), Inches(2))
-        tf = tb.text_frame
-        p = tf.add_paragraph()
-        p.text = title
-        p.font.bold = True
-        p.font.size = Pt(title_size)
-        p.font.name = font
-        p.font.color.rgb = hex_to_rgb(title_color)
-        p.alignment = PP_ALIGN.CENTER
+    slide = prs.slides.add_slide(prs.slide_layouts[5])
+    set_bg(slide, bg_title_path)
+
+    tb = slide.shapes.add_textbox(Inches(1), Inches(2), Inches(8), Inches(2))
+    tf = tb.text_frame
+    tf.word_wrap = True
+    p = tf.add_paragraph()
+    p.text = title
+    p.font.size = Pt(title_size)
+    p.font.bold = True
+    p.font.name = font
+    p.font.color.rgb = hex_to_rgb(title_color)
+    p.alignment = PP_ALIGN.CENTER
 
     # Content Slides
     for item in points:
         key_point = clean_title_text(item.get("title", ""))
         description = item.get("description", "")
-        slide_layout = prs.slide_layouts[1] if template_path else prs.slide_layouts[5]
-        slide = prs.slides.add_slide(slide_layout)
+        slide = prs.slides.add_slide(prs.slide_layouts[5])
+        set_bg(slide, bg_slide_path)
 
-        try:
-            slide.shapes.title.text = key_point
-        except Exception:
-            tb = slide.shapes.add_textbox(Inches(0.8), Inches(0.5), Inches(8), Inches(1))
-            tf = tb.text_frame
-            p = tf.add_paragraph()
-            p.text = key_point
-            p.font.bold = True
-            p.font.size = Pt(title_size)
-            p.font.name = font
-            p.font.color.rgb = hex_to_rgb(title_color)
+        # Title
+        tb_title = slide.shapes.add_textbox(Inches(0.8), Inches(0.5), Inches(8.4), Inches(1.0))
+        tf_title = tb_title.text_frame
+        p_title = tf_title.add_paragraph()
+        p_title.text = key_point
+        p_title.font.bold = True
+        p_title.font.size = Pt(title_size)
+        p_title.font.name = font
+        p_title.font.color.rgb = hex_to_rgb(title_color)
+        p_title.alignment = PP_ALIGN.LEFT
 
+        # Body
         if description:
-            tb = slide.shapes.add_textbox(Inches(1), Inches(2), Inches(7.5), Inches(4))
-            tf = tb.text_frame
+            tb_body = slide.shapes.add_textbox(Inches(1), Inches(1.8), Inches(7.5), Inches(4.2))
+            tf_body = tb_body.text_frame
+            tf_body.word_wrap = True
             for line in description.splitlines():
                 if line.strip():
-                    p = tf.add_paragraph()
-                    p.text = line.strip("•-* ").strip()
-                    p.font.size = Pt(text_size)
-                    p.font.name = font
-                    p.font.color.rgb = hex_to_rgb(text_color)
-                    p.level = 0
+                    p_body = tf_body.add_paragraph()
+                    p_body.text = line.strip("•-* ").strip()
+                    p_body.font.size = Pt(text_size)
+                    p_body.font.name = font
+                    p_body.font.color.rgb = hex_to_rgb(text_color)
+                    p_body.level = 0
+
+        # Footer
+        tb_footer = slide.shapes.add_textbox(Inches(0.5), Inches(6.8), Inches(9), Inches(0.4))
+        tf_footer = tb_footer.text_frame
+        p_footer = tf_footer.add_paragraph()
+        p_footer.text = "Generated with AI"
+        p_footer.font.size = Pt(10)
+        p_footer.font.name = font
+        p_footer.font.color.rgb = RGBColor(150, 150, 150)
+        p_footer.alignment = PP_ALIGN.RIGHT
 
     prs.save(filename)
     return filename
@@ -215,7 +215,8 @@ defaults = {
     "font_choice": "Calibri",
     "title_color": "#5E2A84",
     "text_color": "#282828",
-    "bg_color": "#FFFFFF"
+    "bg_color": "#FFFFFF",
+    "theme": "Custom"
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -243,16 +244,12 @@ with col4:
 with col5:
     st.session_state.bg_color = st.color_picker("🌆 Background Color", st.session_state.bg_color)
 
-# --- Template Option ---
-st.subheader("📂 Template Option")
-use_template = st.radio(
-    "Would you like to generate the PPT in a template?",
-    ("No", "Yes (use uploaded or default template)"),
-    index=0,
+# --- Theme Dropdown ---
+st.session_state.theme = st.selectbox(
+    "🎭 Select Theme",
+    ["Dr.Reddys White Master", "Dr.Reddys Blue Master", "Custom"],
+    index=["Dr.Reddys White Master", "Dr.Reddys Blue Master", "Custom"].index(st.session_state.theme)
 )
-template_file = None
-if use_template == "Yes (use uploaded or default template)":
-    template_file = st.file_uploader("📤 Upload PowerPoint Template (.pptx)", type=["pptx"])
 
 # --- Upload File ---
 uploaded_file = st.file_uploader("📄 Upload a document", type=["pdf", "docx", "txt"])
@@ -319,14 +316,15 @@ if st.session_state.outline_chat:
             with st.spinner("Generating PPT..."):
                 filename = f"{sanitize_filename(new_title)}.pptx"
 
-                # ✅ FIX: handle uploaded or default template
-                temp_template_path = None
-                if template_file:
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".pptx") as tmp_tpl:
-                        tmp_tpl.write(template_file.getvalue())
-                        temp_template_path = tmp_tpl.name
-                elif use_template == "Yes (use uploaded or default template)" and os.path.exists("template.pptx"):
-                    temp_template_path = "template.pptx"
+                # Pick backgrounds based on theme
+                if st.session_state.theme == "Dr.Reddys White Master":
+                    bg_title = "/mnt/data/360_F_373501182_AW73b2wvfm9wBuar0JYwKBeF8NAUHDOH.jpg"
+                    bg_slide = "/mnt/data/pastel-purple-color-solid-background-1920x1080.png"
+                elif st.session_state.theme == "Dr.Reddys Blue Master":
+                    bg_title = "/mnt/data/studio-background-concept-abstract-empty-light-gradient-purple-studio-room-background-product_1258-52339.jpg"
+                    bg_slide = "/mnt/data/pastel-purple-color-solid-background-1920x1080.png"
+                else:
+                    bg_title = bg_slide = None
 
                 create_ppt(
                     new_title,
@@ -338,7 +336,9 @@ if st.session_state.outline_chat:
                     title_color=st.session_state.title_color,
                     text_color=st.session_state.text_color,
                     background_color=st.session_state.bg_color,
-                    template_path=temp_template_path,
+                    theme=st.session_state.theme,
+                    bg_title_path=bg_title,
+                    bg_slide_path=bg_slide,
                 )
 
                 with open(filename, "rb") as f:
@@ -348,6 +348,3 @@ if st.session_state.outline_chat:
                         file_name=filename,
                         mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
                     )
-
-                if temp_template_path and os.path.exists(temp_template_path):
-                    os.remove(temp_template_path)
