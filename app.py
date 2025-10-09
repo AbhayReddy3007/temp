@@ -35,7 +35,14 @@ def call_gemini(prompt: str, timeout: int = 120) -> str:
 def generate_title(summary: str) -> str:
     if not summary or not summary.strip():
         return "Presentation"
-    prompt = f"Generate a short, clear PowerPoint title (under 10 words) for this summary:\n{summary}"
+    prompt = f"""Read the following summary and create a short, clear, presentation-style title.
+- Keep it under 10 words
+- Do not include birth dates, long sentences, or excessive details
+- Just give a clean title, like a presentation heading
+
+Summary:
+{summary}
+"""
     result = call_gemini(prompt)
     return result.split("\n")[0] if result else "Presentation"
 
@@ -143,11 +150,12 @@ def generate_outline(description: str):
     if num_slides:
         count_instruction = f"Generate {num_slides} slides."
     else:
-        count_instruction = "Generate 6-10 slides."
+        count_instruction = "Generate an appropriate number of slides based on the content provided."
     prompt = (
         f"Create a PowerPoint outline on: {description}\n\n"
         f"{count_instruction}\n\n"
         "IMPORTANT: Return the outline in this exact machine-friendly format and nothing else:\n\n"
+        "Each slide should have a short title and 3–4 bullet points."
         "Slide 1: <Title>\n"
         "• <bullet 1>\n"
         "• <bullet 2>\n"
@@ -207,16 +215,84 @@ def split_text(text: str, chunk_size: int = 8000, overlap: int = 300):
     return chunks
 
 def summarize_long_text(full_text: str) -> str:
+    """
+    Produces a comprehensive, exhaustive, and structured summary of the entire document.
+    - If the document is short: analyze whole document directly with a single, thorough prompt.
+    - If the document is long: split into chunks, produce detailed analysis per chunk, then combine
+      into one unified, exhaustive summary that preserves all important points, structure, facts,
+      and nuances.
+    """
     if not full_text or not full_text.strip():
         return ""
+
     chunks = split_text(full_text, chunk_size=8000, overlap=400)
-    if len(chunks) == 1:
-        return call_gemini(f"Summarize in detail:\n{full_text}")
-    analyses = []
-    for i, ch in enumerate(chunks, 1):
-        analyses.append(call_gemini(f"Analyze CHUNK {i}:\n{ch}"))
-    combined = call_gemini("Combine these analyses into a detailed summary:\n\n" + "\n\n".join(analyses))
-    return combined
+
+    # If it's small, ask Gemini to produce a single exhaustive analysis
+    if len(chunks) <= 1:
+        prompt = f"""
+Read and analyze the entire document below thoroughly. Produce a comprehensive, detailed, and exhaustive summary that preserves every important point, fact, argument, example, and nuance from the text. Do NOT oversimplify or omit material. The output should include:
+
+1) An Executive Summary (one paragraph) that captures the overall purpose and conclusions.
+2) A clear reconstruction of the document's structure with headings (e.g., Introduction, Methods/Body, Results/Arguments, Examples, Discussion, Conclusion).
+3) For each section: a long, detailed section-by-section summary with important points, supporting evidence, examples, and any arguments or lines of reasoning fully preserved.
+4) A consolidated list of Key Facts & Figures (as bullets), including any numbers, dates, named items, or data points.
+5) Notable quotes or short excerpts (if present), labelled with approximate location.
+6) Any assumptions, limitations, or open questions raised by the document.
+7) A final 'Key takeaways' bullet list summarizing the most critical items.
+
+Be exhaustive but keep the final output readable and well-structured. Document:
+----------------
+{full_text}
+----------------
+"""
+        return call_gemini(prompt).strip()
+
+    # If long, produce detailed analysis for each chunk then combine.
+    partial_analyses = []
+    for idx, ch in enumerate(chunks, start=1):
+        prompt_chunk = f"""
+You will be given CHUNK {idx} of a larger document. Carefully analyze this chunk and produce:
+A) A detailed, exhaustive summary of CHUNK {idx} that preserves all important points, facts, arguments, examples, and nuance from this chunk.
+B) A short heading describing what this chunk contains (e.g., "Introduction", "Methodology", "Case Study", "Analysis", "Conclusion", etc.).
+C) A list of Key Facts & Figures found in this chunk (bulleted).
+D) Any notable quotes or short excerpts.
+E) Any open questions or references that should be cross-referenced with other chunks.
+
+Label the output clearly as "CHUNK {idx} ANALYSIS".
+
+Chunk content follows:
+----------------
+{ch}
+----------------
+"""
+        analysis = call_gemini(prompt_chunk)
+        partial_analyses.append(f"CHUNK {idx} ANALYSIS:\n{analysis.strip()}")
+
+    combined_analyses_text = "\n\n".join(partial_analyses)
+
+    # Combine into one final exhaustive summary
+    combine_prompt = f"""
+You have a set of detailed chunk analyses from a long document (listed below). Use them to produce ONE unified, coherent, and exhaustive summary of the entire original document. The final output MUST preserve every important point, fact, argument, example, and nuance found across the chunks. DO NOT INVENT new facts.
+
+The final summary should be structured as follows:
+
+1) Executive Summary: One concise paragraph that captures the entire document's purpose and conclusions.
+2) Document Structure Reconstruction: Recreate the original document's sections and provide headings (Introduction, Body sections, Results/Arguments, Examples/Case-Studies, Discussion, Conclusion, etc.). For each reconstructed section, provide a thorough, long-form synthesis combining the chunk-level details.
+3) Consolidated Key Facts & Figures: A single, deduplicated bulleted list containing all factual items (numbers, dates, names, data points) encountered in the chunks. If a fact appears in multiple chunks, include it once and list chunk locations in parentheses.
+4) Important Quotes & Locations: A short list of notable quotes/excerpts and the approximate chunk number where they appear.
+5) Assumptions, Limitations, and Open Questions: Combined and organized.
+6) Key Takeaways: Clear bulleted summary of the most important conclusions and actionable points.
+
+Below are the chunk analyses. Use them to reconstruct the full document and ensure no detail is lost:
+
+----------------
+{combined_analyses_text}
+----------------
+
+Now produce the final unified summary described above.
+"""
+    final_summary = call_gemini(combine_prompt)
+    return final_summary.strip()
 
 # ---------------- file helpers ----------------
 def extract_text(path: str, filename: str) -> str:
