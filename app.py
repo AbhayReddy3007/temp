@@ -7,7 +7,7 @@ from pptx.dml.color import RGBColor
 from pptx.enum.text import PP_ALIGN, MSO_AUTO_SIZE, MSO_VERTICAL_ANCHOR
 
 # ---------------- CONFIG ----------------
-GEMINI_API_KEY = "AIzaSyBtah4ZmuiVkSrJABE8wIjiEgunGXAbT3Q"  # 🔑 Replace or use st.secrets
+GEMINI_API_KEY = ""  # 🔑 Add or use st.secrets["GEMINI_API_KEY"]
 TEXT_MODEL_NAME = "gemini-2.0-flash"
 
 # ---------------- GEMINI HELPERS ----------------
@@ -23,11 +23,7 @@ def call_gemini(prompt: str) -> str:
         return f"⚠️ Gemini API error: {e}"
 
 def generate_title(summary: str) -> str:
-    prompt = f"""Read the following summary and create a short, clear, presentation-style title.
-- Keep it under 10 words.
-Summary:
-{summary}
-"""
+    prompt = f"Generate a short and professional PowerPoint title (under 10 words) for this summary:\n{summary}"
     return call_gemini(prompt).strip()
 
 def extract_slide_count(description: str, default=None):
@@ -68,20 +64,10 @@ def generate_outline(description: str):
     num_slides = extract_slide_count(description, default=None)
     if num_slides:
         prompt = f"""Create a PowerPoint outline on: {description}.
-Generate exactly {num_slides} content slides (excluding title slide).
-Format:
-Slide 1: <Title>
-- Bullet
-- Bullet
-"""
+Generate exactly {num_slides} content slides (excluding title slide)."""
     else:
         prompt = f"""Create a PowerPoint outline on: {description}.
-Each slide should have a short title and 3–4 bullet points.
-Format:
-Slide 1: <Title>
-- Bullet
-- Bullet
-"""
+Each slide should have a title and 3–4 bullet points."""
     outline_text = call_gemini(prompt)
     return parse_points(outline_text)
 
@@ -90,18 +76,12 @@ def edit_outline_with_feedback(outline, feedback: str):
         [f"Slide {i+1}: {s['title']}\n{s['description']}" for i, s in enumerate(outline['slides'])]
     )
     prompt = f"""
-You are an assistant improving a PowerPoint outline.
-
+You are refining a PowerPoint outline based on feedback.
 Current Outline:
-Title: {outline['title']}
 {outline_text}
 
 Feedback:
 {feedback}
-
-Task:
-- Apply feedback and refine outline.
-- Keep the same format.
 """
     updated_points = parse_points(call_gemini(prompt))
     return {"title": outline['title'], "slides": updated_points}
@@ -117,35 +97,29 @@ def split_text(text: str, chunk_size: int = 8000, overlap: int = 300):
     return chunks
 
 def summarize_long_text(full_text: str) -> str:
-    if not full_text or not full_text.strip():
+    if not full_text.strip():
         return ""
-    chunks = split_text(full_text, chunk_size=8000, overlap=400)
+    chunks = split_text(full_text, 8000, 400)
     if len(chunks) <= 1:
-        prompt = f"""Summarize the following text thoroughly:
-{full_text}"""
-        return call_gemini(prompt).strip()
+        return call_gemini(f"Summarize the following document in detail:\n{full_text}")
     analyses = []
     for idx, ch in enumerate(chunks, start=1):
-        prompt = f"""Analyze CHUNK {idx}:
-{ch}"""
-        analyses.append(call_gemini(prompt))
+        analyses.append(call_gemini(f"Analyze CHUNK {idx}:\n{ch}"))
     combined = "\n\n".join(analyses)
-    return call_gemini(f"Combine these into a full exhaustive summary:\n{combined}")
+    return call_gemini(f"Combine these analyses into a complete, detailed summary:\n{combined}")
 
 # ---------------- FILE UTILS ----------------
 def extract_text(path: str, filename: str) -> str:
     name = filename.lower()
     if name.endswith(".pdf"):
-        text_parts = []
         doc = fitz.open(path)
-        for page in doc:
-            text_parts.append(page.get_text("text"))
+        text = "\n".join(page.get_text("text") for page in doc)
         doc.close()
-        return "\n".join(text_parts)
-    if name.endswith(".docx"):
+        return text
+    elif name.endswith(".docx"):
         d = docx.Document(path)
         return "\n".join(p.text for p in d.paragraphs)
-    if name.endswith(".txt"):
+    elif name.endswith(".txt"):
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
             return f.read()
     return ""
@@ -164,10 +138,9 @@ def hex_to_rgb(hex_color: str):
 def create_ppt(title, points, filename="output.pptx", title_size=30, text_size=22,
                font="Calibri", title_color="#5E2A84", text_color="#282828",
                background_color="#FFFFFF", template_path=None):
-    """Create PPT using optional template"""
-    if template_path:
+    """Create PPT using optional template."""
+    if template_path and os.path.exists(template_path):
         prs = Presentation(template_path)
-        # Remove existing slides but keep theme
         for _ in range(len(prs.slides)):
             xml_slides = prs.slides._sldIdLst
             slide_id = xml_slides[0]
@@ -274,11 +247,11 @@ with col5:
 st.subheader("📂 Template Option")
 use_template = st.radio(
     "Would you like to generate the PPT in a template?",
-    ("No", "Yes (use uploaded template)"),
+    ("No", "Yes (use uploaded or default template)"),
     index=0,
 )
 template_file = None
-if use_template == "Yes (use uploaded template)":
+if use_template == "Yes (use uploaded or default template)":
     template_file = st.file_uploader("📤 Upload PowerPoint Template (.pptx)", type=["pptx"])
 
 # --- Upload File ---
@@ -305,7 +278,6 @@ if prompt := st.chat_input("💬 Type a message..."):
         if any(w in prompt.lower() for w in ["ppt", "slides", "presentation"]):
             slides = generate_outline(st.session_state.summary_text + "\n\n" + prompt)
             st.session_state.outline_chat = {"title": st.session_state.summary_title, "slides": slides}
-            st.session_state.doc_chat_history.append(("assistant", "✅ Generated PPT outline."))
         else:
             st.session_state.doc_chat_history.append(("user", prompt))
             reply = call_gemini(f"Answer using this document:\n{st.session_state.summary_text}\n\nQ:{prompt}")
@@ -316,7 +288,6 @@ if prompt := st.chat_input("💬 Type a message..."):
             slides = generate_outline(prompt)
             title = generate_title(prompt)
             st.session_state.outline_chat = {"title": title, "slides": slides}
-            st.session_state.messages.append(("assistant", f"✅ PPT outline generated! Title: **{title}**"))
         else:
             reply = call_gemini(prompt)
             st.session_state.messages.append(("assistant", reply))
@@ -344,39 +315,39 @@ if st.session_state.outline_chat:
                 st.rerun()
 
     with col7:
-    if st.button("✅ Generate PPT"):
-        with st.spinner("Generating PPT..."):
-            filename = f"{sanitize_filename(new_title)}.pptx"
+        if st.button("✅ Generate PPT"):
+            with st.spinner("Generating PPT..."):
+                filename = f"{sanitize_filename(new_title)}.pptx"
 
-            # ✅ FIX: Write uploaded template to a temp file if provided
-            temp_template_path = None
-            if template_file:
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".pptx") as tmp_tpl:
-                    tmp_tpl.write(template_file.getvalue())
-                    temp_template_path = tmp_tpl.name
+                # ✅ FIX: handle uploaded or default template
+                temp_template_path = None
+                if template_file:
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".pptx") as tmp_tpl:
+                        tmp_tpl.write(template_file.getvalue())
+                        temp_template_path = tmp_tpl.name
+                elif use_template == "Yes (use uploaded or default template)" and os.path.exists("template.pptx"):
+                    temp_template_path = "template.pptx"
 
-            create_ppt(
-                new_title,
-                outline["slides"],
-                filename,
-                title_size=int(st.session_state.title_size),
-                text_size=int(st.session_state.text_size),
-                font=st.session_state.font_choice,
-                title_color=st.session_state.title_color,
-                text_color=st.session_state.text_color,
-                background_color=st.session_state.bg_color,
-                template_path=temp_template_path,
-            )
-
-            with open(filename, "rb") as f:
-                st.download_button(
-                    "⬇️ Download PPT",
-                    data=f,
-                    file_name=filename,
-                    mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                create_ppt(
+                    new_title,
+                    outline["slides"],
+                    filename,
+                    title_size=int(st.session_state.title_size),
+                    text_size=int(st.session_state.text_size),
+                    font=st.session_state.font_choice,
+                    title_color=st.session_state.title_color,
+                    text_color=st.session_state.text_color,
+                    background_color=st.session_state.bg_color,
+                    template_path=temp_template_path,
                 )
 
-            # ✅ Cleanup temp template
-            if temp_template_path and os.path.exists(temp_template_path):
-                os.remove(temp_template_path)
+                with open(filename, "rb") as f:
+                    st.download_button(
+                        "⬇️ Download PPT",
+                        data=f,
+                        file_name=filename,
+                        mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                    )
 
+                if temp_template_path and os.path.exists(temp_template_path):
+                    os.remove(temp_template_path)
