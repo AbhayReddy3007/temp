@@ -344,25 +344,39 @@ if st.session_state.outline_chat:
                 st.rerun()
 
     with col7:
-        if st.button("✅ Generate PPT"):
-            with st.spinner("Generating PPT..."):
-                filename = f"{sanitize_filename(new_title)}.pptx"
-                create_ppt(
-                    new_title,
-                    outline["slides"],
-                    filename,
-                    title_size=int(st.session_state.title_size),
-                    text_size=int(st.session_state.text_size),
-                    font=st.session_state.font_choice,
-                    title_color=st.session_state.title_color,
-                    text_color=st.session_state.text_color,
-                    background_color=st.session_state.bg_color,
-                    template_path=template_file.name if template_file else None,
+    if st.button("✅ Generate PPT"):
+        with st.spinner("Generating PPT..."):
+            filename = f"{sanitize_filename(new_title)}.pptx"
+
+            # ✅ FIX: Write uploaded template to a temp file if provided
+            temp_template_path = None
+            if template_file:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".pptx") as tmp_tpl:
+                    tmp_tpl.write(template_file.getvalue())
+                    temp_template_path = tmp_tpl.name
+
+            create_ppt(
+                new_title,
+                outline["slides"],
+                filename,
+                title_size=int(st.session_state.title_size),
+                text_size=int(st.session_state.text_size),
+                font=st.session_state.font_choice,
+                title_color=st.session_state.title_color,
+                text_color=st.session_state.text_color,
+                background_color=st.session_state.bg_color,
+                template_path=temp_template_path,
+            )
+
+            with open(filename, "rb") as f:
+                st.download_button(
+                    "⬇️ Download PPT",
+                    data=f,
+                    file_name=filename,
+                    mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
                 )
-                with open(filename, "rb") as f:
-                    st.download_button(
-                        "⬇️ Download PPT",
-                        data=f,
-                        file_name=filename,
-                        mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-                    )
+
+            # ✅ Cleanup temp template
+            if temp_template_path and os.path.exists(temp_template_path):
+                os.remove(temp_template_path)
+
