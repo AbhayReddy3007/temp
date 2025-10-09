@@ -165,9 +165,17 @@ def create_ppt(title, points, filename="output.pptx", title_size=30, text_size=2
         p_title.alignment = PP_ALIGN.LEFT
 
         if description:
-            tb_body = slide.shapes.add_textbox(Inches(1), Inches(1.8), Inches(7.5), Inches(4.2))
+            slide_format = st.session_state.get("slide_format", "Full Text")
+
+            # Adjust layout based on format
+            if slide_format == "Text & Image":
+                tb_body = slide.shapes.add_textbox(Inches(1), Inches(1.8), Inches(5.0), Inches(4.2))
+            else:
+                tb_body = slide.shapes.add_textbox(Inches(1), Inches(1.8), Inches(7.5), Inches(4.2))
+
             tf_body = tb_body.text_frame
             tf_body.word_wrap = True
+
             for line in description.splitlines():
                 if line.strip():
                     p_body = tf_body.add_paragraph()
@@ -176,6 +184,20 @@ def create_ppt(title, points, filename="output.pptx", title_size=30, text_size=2
                     p_body.font.name = font
                     p_body.font.color.rgb = hex_to_rgb(text_color)
                     p_body.level = 0
+
+            # Optional placeholder for image
+            if slide_format == "Text & Image":
+                left = Inches(6.2)
+                top = Inches(2.0)
+                width = Inches(3.0)
+                height = Inches(3.5)
+                shape = slide.shapes.add_shape(1, left, top, width, height)  # 1 = Rectangle
+                fill = shape.fill
+                fill.solid()
+                fill.fore_color.rgb = RGBColor(235, 235, 235)
+                line = shape.line
+                line.color.rgb = RGBColor(180, 180, 180)
+                shape.text = "Image Placeholder"
 
         tb_footer = slide.shapes.add_textbox(Inches(0.5), Inches(6.8), Inches(9), Inches(0.4))
         tf_footer = tb_footer.text_frame
@@ -205,7 +227,8 @@ defaults = {
     "title_color": "#5E2A84",
     "text_color": "#282828",
     "bg_color": "#FFFFFF",
-    "theme": "Custom"
+    "theme": "Custom",
+    "slide_format": "Full Text"
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -284,54 +307,27 @@ if st.session_state.outline_chat:
     outline = st.session_state.outline_chat
     st.subheader(f"📝 Preview Outline: {outline['title']}")
 
-    # --- Per-slide editing loop ---
+    # Per-slide display
     for idx, slide in enumerate(outline["slides"], start=1):
         with st.expander(f"Slide {idx}: {slide['title']}", expanded=False):
             st.markdown(slide["description"].replace("\n", "\n\n"))
-            feedback = st.text_area(f"✏️ Feedback for Slide {idx}", key=f"feedback_{idx}", height=80)
 
-            if st.button(f"💡 Edit Slide {idx}", key=f"edit_btn_{idx}"):
-                with st.spinner(f"Updating Slide {idx}..."):
-                    prompt = (
-                        f"You are updating a PowerPoint slide based on feedback.\n\n"
-                        f"Slide Title: {slide['title']}\n"
-                        f"Slide Content:\n{slide['description']}\n\n"
-                        f"Feedback:\n{feedback}\n\n"
-                        f"Return ONLY the updated bullet points (each starting with • or -). "
-                        f"Do not add explanations or greetings."
-                    )
-
-                    updated_text = call_gemini(prompt)
-                    updated_points = parse_points(updated_text)
-
-                    if updated_points:
-                        st.session_state.outline_chat["slides"][idx - 1] = updated_points[0]
-                        st.success(f"✅ Slide {idx} updated successfully!")
-                        st.rerun()
-                    else:
-                        bullets = []
-                        for line in updated_text.splitlines():
-                            line_clean = line.strip()
-                            if re.match(r"^[•\-\*\d\)]\s", line_clean):
-                                bullets.append(re.sub(r"^[•\-\*\d\)]\s*", "", line_clean))
-                        if not bullets and "." in updated_text:
-                            bullets = [s.strip() for s in re.split(r"[.!?]", updated_text) if len(s.strip()) > 3]
-                        if bullets:
-                            st.session_state.outline_chat["slides"][idx - 1] = {
-                                "title": slide['title'],
-                                "description": "\n".join(f"• {b}" for b in bullets)
-                            }
-                            st.success(f"✅ Slide {idx} updated successfully (smart fallback)!")
-                            st.rerun()
-                        else:
-                            st.warning(f"⚠️ Could not parse Gemini response. Try rephrasing feedback.")
-
-    # --- Edit Title + Full Feedback ---
+    # Title and feedback
     new_title = st.text_input("📌 Edit Title", value=outline.get("title", "Untitled"))
     feedback_box = st.text_area("✏️ Feedback for outline (optional):")
 
-    col6, col7 = st.columns(2)
+    # Buttons: Format selector + Apply Feedback + Generate PPT
+    col6, col7, col8 = st.columns([1, 1, 1])
+
     with col6:
+        st.session_state.slide_format = st.selectbox(
+            "📐 Slide Format",
+            ["Full Text", "Text & Image"],
+            index=["Full Text", "Text & Image"].index(st.session_state.slide_format),
+            help="Choose how slides should be formatted."
+        )
+
+    with col7:
         if st.button("🔄 Apply Feedback"):
             with st.spinner("Updating outline..."):
                 updated_outline = edit_outline_with_feedback(outline, feedback_box)
@@ -340,11 +336,10 @@ if st.session_state.outline_chat:
                 st.success("✅ Outline updated!")
                 st.rerun()
 
-    with col7:
+    with col8:
         if st.button("✅ Generate PPT"):
             with st.spinner("Generating PPT..."):
                 filename = f"{sanitize_filename(new_title)}.pptx"
-
                 if st.session_state.theme == "Dr.Reddys White Master":
                     bg_title = "/mnt/data/360_F_373501182_AW73b2wvfm9wBuar0JYwKBeF8NAUHDOH.jpg"
                     bg_slide = "/mnt/data/pastel-purple-color-solid-background-1920x1080.png"
