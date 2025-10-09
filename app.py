@@ -167,7 +167,6 @@ def create_ppt(title, points, filename="output.pptx", title_size=30, text_size=2
         if description:
             slide_format = st.session_state.get("slide_format", "Full Text")
 
-            # Adjust layout based on format
             if slide_format == "Text & Image":
                 tb_body = slide.shapes.add_textbox(Inches(1), Inches(1.8), Inches(5.0), Inches(4.2))
             else:
@@ -185,13 +184,12 @@ def create_ppt(title, points, filename="output.pptx", title_size=30, text_size=2
                     p_body.font.color.rgb = hex_to_rgb(text_color)
                     p_body.level = 0
 
-            # Optional placeholder for image
             if slide_format == "Text & Image":
                 left = Inches(6.2)
                 top = Inches(2.0)
                 width = Inches(3.0)
                 height = Inches(3.5)
-                shape = slide.shapes.add_shape(1, left, top, width, height)  # 1 = Rectangle
+                shape = slide.shapes.add_shape(1, left, top, width, height)
                 fill = shape.fill
                 fill.solid()
                 fill.fore_color.rgb = RGBColor(235, 235, 235)
@@ -216,11 +214,9 @@ st.set_page_config(page_title="PPT Generator", layout="wide")
 st.title("🧠 AI PPT Generator")
 
 defaults = {
-    "messages": [], 
-    "outline_chat": None, 
-    "summary_text": None, 
-    "summary_title": None, 
-    "doc_chat_history": [],
+    "outline_chat": None,
+    "summary_text": None,
+    "summary_title": None,
     "title_size": 30,
     "text_size": 22,
     "font_choice": "Calibri",
@@ -244,8 +240,7 @@ with col2:
 
 st.session_state.font_choice = st.selectbox(
     "🔤 Font Family",
-    ["Calibri", "Arial", "Times New Roman", "Verdana", "Georgia", "Helvetica", "Comic Sans MS"],
-    index=0
+    ["Calibri", "Arial", "Times New Roman", "Verdana", "Georgia", "Helvetica", "Comic Sans MS"]
 )
 
 col3, col4, col5 = st.columns(3)
@@ -256,11 +251,9 @@ with col4:
 with col5:
     st.session_state.bg_color = st.color_picker("🌆 Background Color", st.session_state.bg_color)
 
-# --- Theme Dropdown ---
 st.session_state.theme = st.selectbox(
     "🎭 Select Theme",
-    ["Dr.Reddys White Master", "Dr.Reddys Blue Master", "Custom"],
-    index=["Dr.Reddys White Master", "Dr.Reddys Blue Master", "Custom"].index(st.session_state.theme)
+    ["Dr.Reddys White Master", "Dr.Reddys Blue Master", "Custom"]
 )
 
 # --- Upload File ---
@@ -281,52 +274,57 @@ if uploaded_file:
         else:
             st.error("❌ Could not read text from file.")
 
-# --- Chat Input ---
-if prompt := st.chat_input("💬 Type a message..."):
-    if st.session_state.summary_text:
-        if any(w in prompt.lower() for w in ["ppt", "slides", "presentation"]):
-            slides = generate_outline(st.session_state.summary_text + "\n\n" + prompt)
-            st.session_state.outline_chat = {"title": st.session_state.summary_title, "slides": slides}
-        else:
-            st.session_state.doc_chat_history.append(("user", prompt))
-            reply = call_gemini(f"Answer using this document:\n{st.session_state.summary_text}\n\nQ:{prompt}")
-            st.session_state.doc_chat_history.append(("assistant", reply))
-    else:
-        st.session_state.messages.append(("user", prompt))
-        if "ppt" in prompt.lower():
-            slides = generate_outline(prompt)
-            title = generate_title(prompt)
-            st.session_state.outline_chat = {"title": title, "slides": slides}
-        else:
-            reply = call_gemini(prompt)
-            st.session_state.messages.append(("assistant", reply))
-    st.rerun()
-
 # --- Outline Preview + Generate PPT ---
 if st.session_state.outline_chat:
     outline = st.session_state.outline_chat
     st.subheader(f"📝 Preview Outline: {outline['title']}")
 
-    # Per-slide display
+    # --- Per-slide feedback and edit buttons ---
     for idx, slide in enumerate(outline["slides"], start=1):
         with st.expander(f"Slide {idx}: {slide['title']}", expanded=False):
             st.markdown(slide["description"].replace("\n", "\n\n"))
+            feedback = st.text_area(f"✏️ Feedback for Slide {idx}", key=f"feedback_{idx}", height=80)
+            if st.button(f"💡 Edit Slide {idx}", key=f"edit_btn_{idx}"):
+                with st.spinner(f"Updating Slide {idx}..."):
+                    prompt = (
+                        f"You are updating a PowerPoint slide based on feedback.\n\n"
+                        f"Slide Title: {slide['title']}\n"
+                        f"Slide Content:\n{slide['description']}\n\n"
+                        f"Feedback:\n{feedback}\n\n"
+                        f"Return ONLY the updated bullet points (each starting with • or -)."
+                    )
+                    updated_text = call_gemini(prompt)
+                    updated_points = parse_points(updated_text)
+                    if updated_points:
+                        st.session_state.outline_chat["slides"][idx - 1] = updated_points[0]
+                        st.success(f"✅ Slide {idx} updated successfully!")
+                        st.rerun()
+                    else:
+                        bullets = []
+                        for line in updated_text.splitlines():
+                            if re.match(r"^[•\-\*\d\)]\s", line.strip()):
+                                bullets.append(re.sub(r"^[•\-\*\d\)]\s*", "", line.strip()))
+                        if bullets:
+                            st.session_state.outline_chat["slides"][idx - 1] = {
+                                "title": slide['title'],
+                                "description": "\n".join(f"• {b}" for b in bullets)
+                            }
+                            st.success(f"✅ Slide {idx} updated successfully (fallback)!")
+                            st.rerun()
+                        else:
+                            st.warning(f"⚠️ Could not parse Gemini response. Try rephrasing feedback.")
 
-    # Title and feedback
+    # --- Global feedback + dropdown + generate ---
     new_title = st.text_input("📌 Edit Title", value=outline.get("title", "Untitled"))
     feedback_box = st.text_area("✏️ Feedback for outline (optional):")
 
-    # Buttons: Format selector + Apply Feedback + Generate PPT
     col6, col7, col8 = st.columns([1, 1, 1])
-
     with col6:
         st.session_state.slide_format = st.selectbox(
             "📐 Slide Format",
             ["Full Text", "Text & Image"],
-            index=["Full Text", "Text & Image"].index(st.session_state.slide_format),
-            help="Choose how slides should be formatted."
+            index=["Full Text", "Text & Image"].index(st.session_state.slide_format)
         )
-
     with col7:
         if st.button("🔄 Apply Feedback"):
             with st.spinner("Updating outline..."):
@@ -335,7 +333,6 @@ if st.session_state.outline_chat:
                 st.session_state.outline_chat = updated_outline
                 st.success("✅ Outline updated!")
                 st.rerun()
-
     with col8:
         if st.button("✅ Generate PPT"):
             with st.spinner("Generating PPT..."):
@@ -348,7 +345,6 @@ if st.session_state.outline_chat:
                     bg_slide = "/mnt/data/pastel-purple-color-solid-background-1920x1080.png"
                 else:
                     bg_title = bg_slide = None
-
                 create_ppt(
                     new_title,
                     outline["slides"],
@@ -363,7 +359,6 @@ if st.session_state.outline_chat:
                     bg_title_path=bg_title,
                     bg_slide_path=bg_slide,
                 )
-
                 with open(filename, "rb") as f:
                     st.download_button(
                         "⬇️ Download PPT",
