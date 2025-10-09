@@ -131,7 +131,6 @@ def create_ppt(title, points, filename="output.pptx", title_size=30, text_size=2
     prs = Presentation()
     title = clean_title_text(title)
 
-    # Helper: add background image
     def set_bg(slide, image_path):
         if not image_path:
             fill = slide.background.fill
@@ -140,7 +139,6 @@ def create_ppt(title, points, filename="output.pptx", title_size=30, text_size=2
             return
         slide.shapes.add_picture(image_path, 0, 0, width=prs.slide_width, height=prs.slide_height)
 
-    # Title Slide
     slide = prs.slides.add_slide(prs.slide_layouts[5])
     set_bg(slide, bg_title_path)
 
@@ -155,14 +153,12 @@ def create_ppt(title, points, filename="output.pptx", title_size=30, text_size=2
     p.font.color.rgb = hex_to_rgb(title_color)
     p.alignment = PP_ALIGN.CENTER
 
-    # Content Slides
     for item in points:
         key_point = clean_title_text(item.get("title", ""))
         description = item.get("description", "")
         slide = prs.slides.add_slide(prs.slide_layouts[5])
         set_bg(slide, bg_slide_path)
 
-        # Title
         tb_title = slide.shapes.add_textbox(Inches(0.8), Inches(0.5), Inches(8.4), Inches(1.0))
         tf_title = tb_title.text_frame
         p_title = tf_title.add_paragraph()
@@ -173,7 +169,6 @@ def create_ppt(title, points, filename="output.pptx", title_size=30, text_size=2
         p_title.font.color.rgb = hex_to_rgb(title_color)
         p_title.alignment = PP_ALIGN.LEFT
 
-        # Body
         if description:
             tb_body = slide.shapes.add_textbox(Inches(1), Inches(1.8), Inches(7.5), Inches(4.2))
             tf_body = tb_body.text_frame
@@ -187,7 +182,6 @@ def create_ppt(title, points, filename="output.pptx", title_size=30, text_size=2
                     p_body.font.color.rgb = hex_to_rgb(text_color)
                     p_body.level = 0
 
-        # Footer
         tb_footer = slide.shapes.add_textbox(Inches(0.5), Inches(6.8), Inches(9), Inches(0.4))
         tf_footer = tb_footer.text_frame
         p_footer = tf_footer.add_paragraph()
@@ -294,9 +288,29 @@ if prompt := st.chat_input("💬 Type a message..."):
 if st.session_state.outline_chat:
     outline = st.session_state.outline_chat
     st.subheader(f"📝 Preview Outline: {outline['title']}")
+
+    # Per-slide editing loop
     for idx, slide in enumerate(outline["slides"], start=1):
         with st.expander(f"Slide {idx}: {slide['title']}", expanded=False):
             st.markdown(slide["description"].replace("\n", "\n\n"))
+            feedback = st.text_area(f"✏️ Feedback for Slide {idx}", key=f"feedback_{idx}", height=80)
+            if st.button(f"💡 Edit Slide {idx}", key=f"edit_btn_{idx}"):
+                with st.spinner(f"Updating Slide {idx}..."):
+                    prompt = (
+                        f"Refine this PowerPoint slide based on feedback.\n\n"
+                        f"Slide Title: {slide['title']}\n"
+                        f"Slide Content:\n{slide['description']}\n\n"
+                        f"Feedback:\n{feedback}\n\n"
+                        f"Return the revised slide title and bullet points clearly."
+                    )
+                    updated_text = call_gemini(prompt)
+                    updated_points = parse_points(updated_text)
+                    if updated_points:
+                        st.session_state.outline_chat["slides"][idx - 1] = updated_points[0]
+                        st.success(f"✅ Slide {idx} updated successfully!")
+                        st.rerun()
+                    else:
+                        st.warning(f"⚠️ Could not parse updated content for Slide {idx}. Try rephrasing feedback.")
 
     new_title = st.text_input("📌 Edit Title", value=outline.get("title", "Untitled"))
     feedback_box = st.text_area("✏️ Feedback for outline (optional):")
