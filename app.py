@@ -881,7 +881,7 @@ if st.session_state.outline_chat:
                 current = st.session_state.get("slide_formats", {}).get(idx, st.session_state.get("slide_format", "Full Text"))
                 format_key = f"format_{idx}"
                 selected_format = st.selectbox(
-                    f"📐 Format for Slide {idx}",
+                    f" Format for Slide {idx}",
                     ["Full Text", "Text & Image", "Comparison"],
                     index=0 if current not in ["Full Text", "Text & Image", "Comparison"] else ["Full Text", "Text & Image", "Comparison"].index(current),
                     key=format_key
