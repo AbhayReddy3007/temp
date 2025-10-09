@@ -1,5 +1,10 @@
 # app.py
-import os, re, tempfile, fitz, docx, requests
+import os
+import re
+import tempfile
+import fitz
+import docx
+import requests
 import streamlit as st
 from pptx import Presentation
 from pptx.util import Pt, Inches
@@ -134,9 +139,9 @@ def create_ppt(title, points, filename="output.pptx", title_size=30, text_size=2
             return
         slide.shapes.add_picture(image_path, 0, 0, width=prs.slide_width, height=prs.slide_height)
 
+    # Title slide
     slide = prs.slides.add_slide(prs.slide_layouts[5])
     set_bg(slide, bg_title_path)
-
     tb = slide.shapes.add_textbox(Inches(1), Inches(2), Inches(8), Inches(2))
     tf = tb.text_frame
     tf.word_wrap = True
@@ -148,12 +153,14 @@ def create_ppt(title, points, filename="output.pptx", title_size=30, text_size=2
     p.font.color.rgb = hex_to_rgb(title_color)
     p.alignment = PP_ALIGN.CENTER
 
+    # Content slides
     for item in points:
         key_point = clean_title_text(item.get("title", ""))
         description = item.get("description", "")
         slide = prs.slides.add_slide(prs.slide_layouts[5])
         set_bg(slide, bg_slide_path)
 
+        # Slide title
         tb_title = slide.shapes.add_textbox(Inches(0.8), Inches(0.5), Inches(8.4), Inches(1.0))
         tf_title = tb_title.text_frame
         p_title = tf_title.add_paragraph()
@@ -164,9 +171,9 @@ def create_ppt(title, points, filename="output.pptx", title_size=30, text_size=2
         p_title.font.color.rgb = hex_to_rgb(title_color)
         p_title.alignment = PP_ALIGN.LEFT
 
+        # Body according to chosen format
         if description:
             slide_format = st.session_state.get("slide_format", "Full Text")
-
             if slide_format == "Text & Image":
                 tb_body = slide.shapes.add_textbox(Inches(1), Inches(1.8), Inches(5.0), Inches(4.2))
             else:
@@ -184,12 +191,13 @@ def create_ppt(title, points, filename="output.pptx", title_size=30, text_size=2
                     p_body.font.color.rgb = hex_to_rgb(text_color)
                     p_body.level = 0
 
+            # Optional: image placeholder for Text & Image
             if slide_format == "Text & Image":
                 left = Inches(6.2)
                 top = Inches(2.0)
                 width = Inches(3.0)
                 height = Inches(3.5)
-                shape = slide.shapes.add_shape(1, left, top, width, height)
+                shape = slide.shapes.add_shape(1, left, top, width, height)  # 1 = Rectangle
                 fill = shape.fill
                 fill.solid()
                 fill.fore_color.rgb = RGBColor(235, 235, 235)
@@ -197,6 +205,7 @@ def create_ppt(title, points, filename="output.pptx", title_size=30, text_size=2
                 line.color.rgb = RGBColor(180, 180, 180)
                 shape.text = "Image Placeholder"
 
+        # Footer
         tb_footer = slide.shapes.add_textbox(Inches(0.5), Inches(6.8), Inches(9), Inches(0.4))
         tf_footer = tb_footer.text_frame
         p_footer = tf_footer.add_paragraph()
@@ -213,10 +222,13 @@ def create_ppt(title, points, filename="output.pptx", title_size=30, text_size=2
 st.set_page_config(page_title="PPT Generator", layout="wide")
 st.title("🧠 AI PPT Generator")
 
+# -- session defaults (restored message/chat keys included)
 defaults = {
+    "messages": [],
     "outline_chat": None,
     "summary_text": None,
     "summary_title": None,
+    "doc_chat_history": [],
     "title_size": 30,
     "text_size": 22,
     "font_choice": "Calibri",
@@ -240,7 +252,8 @@ with col2:
 
 st.session_state.font_choice = st.selectbox(
     "🔤 Font Family",
-    ["Calibri", "Arial", "Times New Roman", "Verdana", "Georgia", "Helvetica", "Comic Sans MS"]
+    ["Calibri", "Arial", "Times New Roman", "Verdana", "Georgia", "Helvetica", "Comic Sans MS"],
+    index=["Calibri", "Arial", "Times New Roman", "Verdana", "Georgia", "Helvetica", "Comic Sans MS"].index(st.session_state.font_choice)
 )
 
 col3, col4, col5 = st.columns(3)
@@ -251,9 +264,11 @@ with col4:
 with col5:
     st.session_state.bg_color = st.color_picker("🌆 Background Color", st.session_state.bg_color)
 
+# --- Theme Dropdown ---
 st.session_state.theme = st.selectbox(
     "🎭 Select Theme",
-    ["Dr.Reddys White Master", "Dr.Reddys Blue Master", "Custom"]
+    ["Dr.Reddys White Master", "Dr.Reddys Blue Master", "Custom"],
+    index=["Dr.Reddys White Master", "Dr.Reddys Blue Master", "Custom"].index(st.session_state.theme)
 )
 
 # --- Upload File ---
@@ -273,6 +288,45 @@ if uploaded_file:
             st.success("✅ Document processed successfully!")
         else:
             st.error("❌ Could not read text from file.")
+
+# --- Chat Input (restored) ---
+if prompt := st.chat_input("💬 Type a message..."):
+    if st.session_state.summary_text:
+        # If we already processed a document, use it to answer or make slides
+        if any(w in prompt.lower() for w in ["ppt", "slides", "presentation"]):
+            slides = generate_outline(st.session_state.summary_text + "\n\n" + prompt)
+            st.session_state.outline_chat = {"title": st.session_state.summary_title, "slides": slides}
+        else:
+            st.session_state.doc_chat_history.append(("user", prompt))
+            reply = call_gemini(f"Answer using this document:\n{st.session_state.summary_text}\n\nQ:{prompt}")
+            st.session_state.doc_chat_history.append(("assistant", reply))
+    else:
+        # No document context — normal chat / generate slides from prompt
+        st.session_state.messages.append(("user", prompt))
+        if "ppt" in prompt.lower():
+            slides = generate_outline(prompt)
+            title = generate_title(prompt)
+            st.session_state.outline_chat = {"title": title, "slides": slides}
+        else:
+            reply = call_gemini(prompt)
+            st.session_state.messages.append(("assistant", reply))
+    st.rerun()
+
+# Optional: show simple chat history (messages)
+if st.session_state.get("messages"):
+    for role, text in st.session_state["messages"][-6:]:  # last 6 messages
+        if role == "user":
+            st.markdown(f"**You:** {text}")
+        else:
+            st.markdown(f"**Assistant:** {text}")
+
+# Optional: show doc-chat history if a document was uploaded
+if st.session_state.get("doc_chat_history"):
+    for role, text in st.session_state["doc_chat_history"][-6:]:
+        if role == "user":
+            st.markdown(f"**You (doc):** {text}")
+        else:
+            st.markdown(f"**Assistant (doc):** {text}")
 
 # --- Outline Preview + Generate PPT ---
 if st.session_state.outline_chat:
@@ -304,6 +358,8 @@ if st.session_state.outline_chat:
                         for line in updated_text.splitlines():
                             if re.match(r"^[•\-\*\d\)]\s", line.strip()):
                                 bullets.append(re.sub(r"^[•\-\*\d\)]\s*", "", line.strip()))
+                        if not bullets and "." in updated_text:
+                            bullets = [s.strip() for s in re.split(r"[.!?]", updated_text) if len(s.strip()) > 3]
                         if bullets:
                             st.session_state.outline_chat["slides"][idx - 1] = {
                                 "title": slide['title'],
@@ -314,7 +370,7 @@ if st.session_state.outline_chat:
                         else:
                             st.warning(f"⚠️ Could not parse Gemini response. Try rephrasing feedback.")
 
-    # --- Global feedback + dropdown + generate ---
+    # --- Global title and feedback + format dropdown + generate ---
     new_title = st.text_input("📌 Edit Title", value=outline.get("title", "Untitled"))
     feedback_box = st.text_area("✏️ Feedback for outline (optional):")
 
@@ -345,6 +401,7 @@ if st.session_state.outline_chat:
                     bg_slide = "/mnt/data/pastel-purple-color-solid-background-1920x1080.png"
                 else:
                     bg_title = bg_slide = None
+
                 create_ppt(
                     new_title,
                     outline["slides"],
@@ -359,6 +416,7 @@ if st.session_state.outline_chat:
                     bg_title_path=bg_title,
                     bg_slide_path=bg_slide,
                 )
+
                 with open(filename, "rb") as f:
                     st.download_button(
                         "⬇️ Download PPT",
@@ -366,3 +424,5 @@ if st.session_state.outline_chat:
                         file_name=filename,
                         mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
                     )
+
+# End of file
