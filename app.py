@@ -407,6 +407,7 @@ if st.session_state.outline_chat:
         with st.expander(f"Slide {idx}: {slide['title']}", expanded=False):
             st.markdown(slide["description"].replace("\n", "\n\n"))
             feedback = st.text_area(f"✏️ Feedback for Slide {idx}", key=f"feedback_{idx}", height=80)
+
             if st.button(f"💡 Edit Slide {idx}", key=f"edit_btn_{idx}"):
                 with st.spinner(f"Updating Slide {idx}..."):
                     prompt = (
@@ -418,12 +419,32 @@ if st.session_state.outline_chat:
                     )
                     updated_text = call_gemini(prompt)
                     updated_points = parse_points(updated_text)
+
                     if updated_points:
                         st.session_state.outline_chat["slides"][idx - 1] = updated_points[0]
                         st.success(f"✅ Slide {idx} updated successfully!")
                         st.rerun()
                     else:
-                        st.warning(f"⚠️ Could not parse updated content for Slide {idx}. Try rephrasing feedback.")
+                        # --- Fallback Mode ---
+                        if "•" in updated_text or "-" in updated_text:
+                            title_line = slide['title']
+                            desc = []
+                            for line in updated_text.splitlines():
+                                if any(x in line for x in ["•", "-", "*"]):
+                                    desc.append(line.strip("•-* ").strip())
+
+                            if desc:
+                                st.session_state.outline_chat["slides"][idx - 1] = {
+                                    "title": title_line,
+                                    "description": "\n".join(f"• {d}" for d in desc)
+                                }
+                                st.success(f"✅ Slide {idx} updated successfully (fallback mode)!")
+                                st.rerun()
+                            else:
+                                st.warning(f"⚠️ Gemini response didn’t contain valid bullet points. Try rephrasing feedback.")
+                        else:
+                            st.warning(f"⚠️ Could not parse updated content for Slide {idx}. Try rephrasing feedback.")
+
 
     new_title = st.text_input("📌 Edit Title", value=outline.get("title", "Untitled"))
     feedback_box = st.text_area("✏️ Feedback for outline (optional):")
