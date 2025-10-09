@@ -7,7 +7,7 @@ from pptx.dml.color import RGBColor
 from pptx.enum.text import PP_ALIGN, MSO_AUTO_SIZE, MSO_VERTICAL_ANCHOR
 
 # ---------------- CONFIG ----------------
-GEMINI_API_KEY = ""  # 🔑 Add or use st.secrets["GEMINI_API_KEY"]
+GEMINI_API_KEY = "AIzaSyBtah4ZmuiVkSrJABE8wIjiEgunGXAbT3Q"  # 🔑 Add or use st.secrets["GEMINI_API_KEY"]
 TEXT_MODEL_NAME = "gemini-2.0-flash"
 
 # ---------------- GEMINI HELPERS ----------------
