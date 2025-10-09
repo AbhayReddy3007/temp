@@ -790,8 +790,8 @@ st.session_state.theme = st.selectbox(
 st.markdown("---")
 
 # upload doc
-st.markdown("### 📄 Upload a document (optional) — PDF, DOCX, TXT")
-uploaded_file = st.file_uploader("Upload a document to generate slides from", type=["pdf", "docx", "txt"])
+st.markdown("### Upload a document")
+uploaded_file = st.file_uploader("Upload a document to generate a PPT from it", type=["pdf", "docx", "txt"])
 if uploaded_file:
     with st.spinner("Extracting text from file..."):
         try:
@@ -812,7 +812,7 @@ if uploaded_file:
             st.error("❌ Could not extract text from the uploaded file.")
 
 # chat input
-st.markdown("### 💬 Chat / Prompt")
+
 chat_prompt = st.chat_input("Type a message (ask for 'ppt' or 'slides' to create an outline)...")
 if chat_prompt:
     if st.session_state.summary_text:
@@ -863,7 +863,7 @@ st.markdown("---")
 if st.session_state.outline_chat:
     outline = st.session_state.outline_chat
     st.subheader(f"📝 Preview Outline: {outline.get('title', 'Presentation')}")
-    st.write("Per-slide: preview, give feedback, set format (Full Text / Text & Image / Comparison), upload image, apply edits.")
+    
 
     for idx, slide in enumerate(outline.get("slides", []), start=1):
         with st.expander(f"Slide {idx}: {slide.get('title','')}", expanded=False):
