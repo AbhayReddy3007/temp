@@ -1,6 +1,6 @@
 # app.py
 # Full-featured AI PPT Generator with robust parsing + per-slide formats + per-slide image upload
-# ~450+ lines
+# Corrected: ensures helper functions are defined before use (no NameError)
 
 import os
 import re
@@ -48,6 +48,21 @@ def generate_title(summary: str) -> str:
     result = call_gemini(prompt)
     return result.split("\n")[0] if result else "Presentation"
 
+# ---------------- SMALL UTIL (EXTRACT SLIDE COUNT) ----------------
+def extract_slide_count(description: str, default=None):
+    """
+    Heuristic to look for phrases like '10 slides' or '8 sections' in the user's
+    description. Returns the number of slides (int) or None if not found.
+    Keep at least 1.
+    """
+    if not description:
+        return None if default is None else max(1, default - 1)
+    m = re.search(r"(\d+)\s*(slides?|sections?|pages?)", description, re.IGNORECASE)
+    if m:
+        total = int(m.group(1))
+        return max(1, total - 1)
+    return None if default is None else max(1, default - 1)
+
 # ---------------- ROBUST PARSER + OUTLINE HELPERS ----------------
 def parse_points(points_text: str):
     """
@@ -63,7 +78,6 @@ def parse_points(points_text: str):
         return []
 
     text = points_text.replace("\r\n", "\n").strip()
-
     slides = []
 
     # 1) Try explicit "Slide N:" sections
@@ -73,7 +87,6 @@ def parse_points(points_text: str):
             block = block.strip()
             if not block:
                 continue
-            # Extract header line
             lines = [ln for ln in block.splitlines() if ln.strip()]
             if not lines:
                 continue
@@ -83,10 +96,8 @@ def parse_points(points_text: str):
                 title = m.group(1).strip()
                 body_lines = lines[1:]
             else:
-                # fallback: first line as title
                 title = lines[0].strip()
                 body_lines = lines[1:]
-            # Normalize bullets
             normalized = []
             for ln in body_lines:
                 if re.match(r"^\s*[\-\u2022\*]\s+", ln):
@@ -126,7 +137,6 @@ def parse_points(points_text: str):
     if lines:
         title = lines[0]
         body = "\n".join(lines[1:]) if len(lines) > 1 else ""
-        # normalize bullets in body
         body_lines = []
         for ln in body.splitlines():
             if re.match(r"^\s*[\-\u2022\*]\s+", ln):
@@ -609,7 +619,6 @@ if st.session_state.outline_chat:
                             st.success(f"✅ Slide {idx} updated successfully.")
                             st.rerun()
                         else:
-                            # fallback heuristics
                             bullets = []
                             for l in result.splitlines():
                                 l = l.strip()
