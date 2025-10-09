@@ -1,6 +1,6 @@
 # app.py
-# Full-featured AI PPT Generator with robust parsing + per-slide formats + per-slide image upload
-# Corrected: ensures helper functions are defined before use (no NameError)
+# Full-featured AI PPT Generator with per-slide "Full Text" / "Text & Image" / "Comparison"
+# Includes per-slide image upload and comparison two-column slide layout.
 
 import os
 import re
@@ -17,44 +17,31 @@ from pptx.enum.text import PP_ALIGN
 from pptx.enum.shapes import MSO_SHAPE
 
 # ---------------- CONFIG ----------------
-# Replace with your own Gemini API key (or load from environment)
+# Replace with your own Gemini API key or load from environment in production
 GEMINI_API_KEY = "AIzaSyBtah4ZmuiVkSrJABE8wIjiEgunGXAbT3Q"
 TEXT_MODEL_NAME = "gemini-2.0-flash"
 
 # ---------------- LLM / GEMINI HELPERS ----------------
 def call_gemini(prompt: str, timeout: int = 120) -> str:
-    """
-    Call Gemini (Generative Language) API with a prompt.
-    Returns plain text or an error string if something fails.
-    """
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{TEXT_MODEL_NAME}:generateContent?key={GEMINI_API_KEY}"
     payload = {"contents": [{"parts": [{"text": prompt}]}]}
     try:
         resp = requests.post(url, json=payload, timeout=timeout)
         resp.raise_for_status()
         data = resp.json()
-        # Defensive extraction
         return data["candidates"][0]["content"]["parts"][0]["text"].strip()
     except Exception as e:
         return f"⚠️ Gemini API error: {e}"
 
 def generate_title(summary: str) -> str:
-    """
-    Generate a short PowerPoint title (under 10 words) using Gemini.
-    """
     if not summary or not summary.strip():
         return "Presentation"
     prompt = f"Generate a short, clear PowerPoint title (under 10 words) for this summary:\n{summary}"
     result = call_gemini(prompt)
     return result.split("\n")[0] if result else "Presentation"
 
-# ---------------- SMALL UTIL (EXTRACT SLIDE COUNT) ----------------
+# ---------------- UTIL: Extract slide count ----------------
 def extract_slide_count(description: str, default=None):
-    """
-    Heuristic to look for phrases like '10 slides' or '8 sections' in the user's
-    description. Returns the number of slides (int) or None if not found.
-    Keep at least 1.
-    """
     if not description:
         return None if default is None else max(1, default - 1)
     m = re.search(r"(\d+)\s*(slides?|sections?|pages?)", description, re.IGNORECASE)
@@ -63,16 +50,11 @@ def extract_slide_count(description: str, default=None):
         return max(1, total - 1)
     return None if default is None else max(1, default - 1)
 
-# ---------------- ROBUST PARSER + OUTLINE HELPERS ----------------
+# ---------------- PARSING + OUTLINE HELPERS ----------------
 def parse_points(points_text: str):
     """
-    Robust parser that handles multiple Gemini output formats.
-    Returns a list of slides: [{"title": ..., "description": "• bullet\n• bullet"}, ...]
-    Strategies:
-      - If "Slide N:" headers exist, split on them.
-      - Else, split by double-newline blocks and treat first line as title.
-      - Else, if many short lines, treat each as a slide title.
-      - Else return a single slide with first line as title and rest as body.
+    Parse Gemini output into slides. Accepts Slide N: style, block style,
+    or single-slide content. Return list of dicts: {"title":..., "description": "..."}.
     """
     if not points_text:
         return []
@@ -80,7 +62,7 @@ def parse_points(points_text: str):
     text = points_text.replace("\r\n", "\n").strip()
     slides = []
 
-    # 1) Try explicit "Slide N:" sections
+    # 1) Split on explicit Slide N: headers
     split_by_slide = re.split(r"\n(?=Slide\s*\d+\s*:)", text, flags=re.IGNORECASE)
     if len(split_by_slide) > 1:
         for block in split_by_slide:
@@ -107,7 +89,7 @@ def parse_points(points_text: str):
             slides.append({"title": title, "description": "\n".join(normalized).strip()})
         return slides
 
-    # 2) Try double-newline blocks
+    # 2) Split by double newline into blocks
     blocks = [b.strip() for b in re.split(r"\n\s*\n", text) if b.strip()]
     if len(blocks) > 1:
         for blk in blocks:
@@ -133,7 +115,7 @@ def parse_points(points_text: str):
                 slides.append({"title": ln, "description": ""})
             return slides
 
-    # 4) Last resort: single slide with first line title, rest body
+    # 4) Last resort: one slide with first line title and rest body
     if lines:
         title = lines[0]
         body = "\n".join(lines[1:]) if len(lines) > 1 else ""
@@ -148,19 +130,13 @@ def parse_points(points_text: str):
     return []
 
 def generate_outline(description: str):
-    """
-    Ask Gemini to create a slide-by-slide outline and FORCE a strict machine-friendly format.
-    The assistant is explicitly told to return ONLY the exact format we require.
-    """
     if not description or not description.strip():
         return []
-
     num_slides = extract_slide_count(description, default=None)
     if num_slides:
         count_instruction = f"Generate {num_slides} slides."
     else:
         count_instruction = "Generate 6-10 slides."
-
     prompt = (
         f"Create a PowerPoint outline on: {description}\n\n"
         f"{count_instruction}\n\n"
@@ -178,11 +154,8 @@ def generate_outline(description: str):
         "... and so on for every slide.\n\n"
         "Do NOT include any extra text, explanation, or numbered lists. Use 'Slide N:' headers exactly as above and use bullets starting with '•' or '-' for bullet points."
     )
-
     outline_text = call_gemini(prompt)
     slides = parse_points(outline_text)
-
-    # If parsing failed (empty), retry with a simpler prompt once
     if not slides:
         retry_prompt = (
             f"Return the outline only in this exact format:\n"
@@ -193,16 +166,11 @@ def generate_outline(description: str):
         )
         outline_text2 = call_gemini(retry_prompt)
         slides = parse_points(outline_text2)
-
     return slides
 
 def edit_outline_with_feedback(outline, feedback: str):
-    """
-    Ask Gemini to refine the existing outline but again force the output format.
-    """
     if not outline or "slides" not in outline:
         return outline
-
     outline_text = "\n".join([f"Slide {i+1}: {s['title']}\n{s['description']}" for i, s in enumerate(outline['slides'])])
     prompt = (
         "Refine the outline below based on feedback.\n\n"
@@ -219,17 +187,11 @@ def edit_outline_with_feedback(outline, feedback: str):
         "...\n"
         "Do NOT include commentary. Return only the updated outline."
     )
-
     updated = call_gemini(prompt)
     updated_slides = parse_points(updated)
-
-    # Fallback: if parse returns empty, try a simpler prompt
     if not updated_slides:
-        retry = call_gemini(
-            f"Return the updated outline only (Slide N: format). Outline:\n{outline_text}\nFeedback:\n{feedback}"
-        )
+        retry = call_gemini(f"Return the updated outline only (Slide N: format). Outline:\n{outline_text}\nFeedback:\n{feedback}")
         updated_slides = parse_points(retry)
-
     return {"title": outline.get("title", "Presentation"), "slides": updated_slides}
 
 # ---------------- LONG TEXT SUMMARIZATION ----------------
@@ -305,6 +267,81 @@ def _add_image_to_slide(slide, image_bytes, left, top, width=None, height=None):
     except Exception:
         pass
 
+def parse_comparison_block(description: str):
+    """
+    Parse a description expected to contain:
+      Left: Topic A
+      • bullet
+      • bullet
+
+      Right: Topic B
+      • bullet
+      • bullet
+
+    Returns (left_title, left_bullets_list, right_title, right_bullets_list)
+    Fallback: if markers missing, split half/half.
+    """
+    left_title = ""
+    right_title = ""
+    left_lines = []
+    right_lines = []
+    lines = [ln.strip() for ln in description.splitlines() if ln.strip()]
+    mode = None
+    for ln in lines:
+        mleft = re.match(r"^Left\s*:\s*(.+)$", ln, re.IGNORECASE)
+        mright = re.match(r"^Right\s*:\s*(.+)$", ln, re.IGNORECASE)
+        if mleft:
+            mode = "left"
+            left_title = mleft.group(1).strip()
+            continue
+        if mright:
+            mode = "right"
+            right_title = mright.group(1).strip()
+            continue
+        # If line begins with "Topic A:" style
+        mleft2 = re.match(r"^(.+?)\s*-\s*Left\s*$", ln, re.IGNORECASE)
+        if not mode and re.search(r'vs|v\.|versus', ln, re.IGNORECASE):
+            # fallback: "A vs B" last resort
+            parts = re.split(r'\s+vs\.?\s+|\s+v\.?\s+|\s+versus\s+', ln, flags=re.IGNORECASE)
+            if len(parts) == 2:
+                left_title = parts[0].strip()
+                right_title = parts[1].strip()
+                mode = "left"  # start collecting left next
+                continue
+        # bullet detection
+        if re.match(r"^[\-\u2022\*]\s+", ln):
+            cleaned = re.sub(r"^[\-\u2022\*]\s*", "", ln).strip()
+            if mode == "left":
+                left_lines.append(cleaned)
+            elif mode == "right":
+                right_lines.append(cleaned)
+            else:
+                # if no mode yet, assume left until 'Right:' found
+                left_lines.append(cleaned)
+        else:
+            # plain line — if mode known and title empty, set as title
+            if mode == "left" and not left_title:
+                left_title = ln
+            elif mode == "right" and not right_title:
+                right_title = ln
+            else:
+                # append as bullet to active mode if exists, else left
+                if mode == "left":
+                    left_lines.append(ln)
+                elif mode == "right":
+                    right_lines.append(ln)
+                else:
+                    left_lines.append(ln)
+    # fallback: if only left_lines exist and no 'right', try splitting left_lines roughly
+    if not right_title and not right_lines and left_lines and (len(left_lines) > 1):
+        # try to split middle
+        mid = len(left_lines) // 2
+        right_lines = left_lines[mid:]
+        left_lines = left_lines[:mid]
+        if not right_title:
+            right_title = "Comparison"
+    return left_title or "Left", left_lines, right_title or "Right", right_lines
+
 def create_ppt(title, points, filename="output.pptx", title_size=30, text_size=22,
                font="Calibri", title_color="#5E2A84", text_color="#282828",
                background_color="#FFFFFF", theme="Custom",
@@ -339,10 +376,10 @@ def create_ppt(title, points, filename="output.pptx", title_size=30, text_size=2
     p.font.color.rgb = hex_to_rgb(title_color)
     p.alignment = PP_ALIGN.LEFT
 
+    # Content slides
     for idx, item in enumerate(points, start=1):
         key_point = clean_title_text(item.get("title", f"Slide {idx}"))
         description = item.get("description", "")
-        # per-slide format
         slide_format = st.session_state.get("slide_formats", {}).get(idx, st.session_state.get("slide_format", "Full Text"))
 
         slide = prs.slides.add_slide(prs.slide_layouts[5])
@@ -359,46 +396,104 @@ def create_ppt(title, points, filename="output.pptx", title_size=30, text_size=2
         p_title.font.color.rgb = hex_to_rgb(title_color)
         p_title.alignment = PP_ALIGN.LEFT
 
-        # Body box size depends on layout
-        if description:
+        # Normal Full Text or Text & Image behavior
+        if slide_format in ("Full Text", "Text & Image"):
+            if description:
+                if slide_format == "Text & Image":
+                    tb_body = slide.shapes.add_textbox(Inches(1), Inches(1.6), Inches(5.0), Inches(4.0))
+                else:
+                    tb_body = slide.shapes.add_textbox(Inches(1), Inches(1.6), Inches(8.0), Inches(4.0))
+                tf_body = tb_body.text_frame
+                tf_body.word_wrap = True
+                for line in description.splitlines():
+                    if line.strip():
+                        p_body = tf_body.add_paragraph()
+                        p_body.text = line.strip("•-* ").strip()
+                        p_body.font.size = Pt(text_size)
+                        p_body.font.name = font
+                        p_body.font.color.rgb = hex_to_rgb(text_color)
+                        p_body.level = 0
+
+            # Text & Image right side
             if slide_format == "Text & Image":
-                tb_body = slide.shapes.add_textbox(Inches(1), Inches(1.6), Inches(5.0), Inches(4.0))
-            else:
-                tb_body = slide.shapes.add_textbox(Inches(1), Inches(1.6), Inches(8.0), Inches(4.0))
+                img_bytes = st.session_state.get("slide_images", {}).get(idx)
+                if img_bytes:
+                    left = Inches(6.0); top = Inches(1.6); width = Inches(3.0)
+                    _add_image_to_slide(slide, img_bytes, left, top, width=width)
+                else:
+                    # placeholder box
+                    left = Inches(6.0); top = Inches(1.6); width = Inches(3.0); height = Inches(3.0)
+                    try:
+                        shape = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, left, top, width, height)
+                        shape.fill.solid()
+                        shape.fill.fore_color.rgb = RGBColor(240, 240, 240)
+                        shape.line.color.rgb = RGBColor(200, 200, 200)
+                        shape.text = "Image Placeholder"
+                    except Exception:
+                        pass
 
-            tf_body = tb_body.text_frame
-            tf_body.word_wrap = True
-            for line in description.splitlines():
-                if line.strip():
-                    p_body = tf_body.add_paragraph()
-                    p_body.text = line.strip("•-* ").strip()
-                    p_body.font.size = Pt(text_size)
-                    p_body.font.name = font
-                    p_body.font.color.rgb = hex_to_rgb(text_color)
-                    p_body.level = 0
+        # Comparison layout: two columns
+        elif slide_format == "Comparison":
+            # parse left/right pieces from description
+            left_title, left_lines, right_title, right_lines = parse_comparison_block(description or "")
 
-        # If Text & Image and image available, insert
-        if slide_format == "Text & Image":
-            img_bytes = None
-            slide_images = st.session_state.get("slide_images", {})
-            if slide_images.get(idx):
-                img_bytes = slide_images.get(idx)
-            if img_bytes:
-                left = Inches(6.0)
-                top = Inches(1.6)
-                width = Inches(3.0)
-                _add_image_to_slide(slide, img_bytes, left, top, width=width)
+            # left column
+            tb_left_title = slide.shapes.add_textbox(Inches(0.6), Inches(1.2), Inches(4.0), Inches(0.7))
+            tf_lt = tb_left_title.text_frame
+            p_lt = tf_lt.add_paragraph()
+            p_lt.text = left_title
+            p_lt.font.size = Pt(int(title_size * 0.8))
+            p_lt.font.bold = True
+            p_lt.font.name = font
+            p_lt.font.color.rgb = hex_to_rgb(title_color)
+            p_lt.alignment = PP_ALIGN.LEFT
+
+            tb_left = slide.shapes.add_textbox(Inches(0.6), Inches(1.9), Inches(4.0), Inches(4.0))
+            tf_left = tb_left.text_frame
+            tf_left.word_wrap = True
+            if left_lines:
+                for ln in left_lines:
+                    p = tf_left.add_paragraph()
+                    p.text = ln
+                    p.font.size = Pt(text_size)
+                    p.font.name = font
+                    p.font.color.rgb = hex_to_rgb(text_color)
+                    p.level = 0
             else:
-                # placeholder rectangle
-                left = Inches(6.0); top = Inches(1.6); width = Inches(3.0); height = Inches(3.0)
-                try:
-                    shape = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, left, top, width, height)
-                    shape.fill.solid()
-                    shape.fill.fore_color.rgb = RGBColor(240, 240, 240)
-                    shape.line.color.rgb = RGBColor(200, 200, 200)
-                    shape.text = "Image Placeholder"
-                except Exception:
-                    pass
+                p = tf_left.add_paragraph()
+                p.text = "—"
+                p.font.size = Pt(text_size)
+                p.font.name = font
+                p.font.color.rgb = hex_to_rgb(text_color)
+
+            # right column
+            tb_right_title = slide.shapes.add_textbox(Inches(5.2), Inches(1.2), Inches(4.0), Inches(0.7))
+            tf_rt = tb_right_title.text_frame
+            p_rt = tf_rt.add_paragraph()
+            p_rt.text = right_title
+            p_rt.font.size = Pt(int(title_size * 0.8))
+            p_rt.font.bold = True
+            p_rt.font.name = font
+            p_rt.font.color.rgb = hex_to_rgb(title_color)
+            p_rt.alignment = PP_ALIGN.LEFT
+
+            tb_right = slide.shapes.add_textbox(Inches(5.2), Inches(1.9), Inches(4.0), Inches(4.0))
+            tf_right = tb_right.text_frame
+            tf_right.word_wrap = True
+            if right_lines:
+                for ln in right_lines:
+                    p = tf_right.add_paragraph()
+                    p.text = ln
+                    p.font.size = Pt(text_size)
+                    p.font.name = font
+                    p.font.color.rgb = hex_to_rgb(text_color)
+                    p.level = 0
+            else:
+                p = tf_right.add_paragraph()
+                p.text = "—"
+                p.font.size = Pt(text_size)
+                p.font.name = font
+                p.font.color.rgb = hex_to_rgb(text_color)
 
         # Footer
         tb_footer = slide.shapes.add_textbox(Inches(0.5), Inches(6.8), Inches(9), Inches(0.4))
@@ -415,9 +510,8 @@ def create_ppt(title, points, filename="output.pptx", title_size=30, text_size=2
 
 # ---------------- STREAMLIT UI ----------------
 st.set_page_config(page_title="AI PPT Generator", layout="wide")
-st.title("🧠 AI PPT Generator — Per-slide Formats & Images (Robust)")
+st.title("🧠 AI PPT Generator — Full Text / Text & Image / Comparison")
 
-# Session state defaults
 _defaults = {
     "messages": [],
     "doc_chat_history": [],
@@ -439,7 +533,7 @@ for k, v in _defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
-# ---------- Customization panel ----------
+# Customization panel
 st.subheader("🎨 Customize PPT Style")
 col1, col2 = st.columns(2)
 with col1:
@@ -469,7 +563,7 @@ st.session_state.theme = st.selectbox(
 
 st.markdown("---")
 
-# ---------- Upload document (optional) ----------
+# Upload document
 st.markdown("### 📄 Upload a document (optional) — PDF, DOCX, TXT")
 uploaded_file = st.file_uploader("Upload a document to generate slides from", type=["pdf", "docx", "txt"])
 if uploaded_file:
@@ -484,7 +578,6 @@ if uploaded_file:
                 os.remove(tmp_path)
             except Exception:
                 pass
-
         if text and text.strip():
             st.session_state.summary_text = summarize_long_text(text)
             st.session_state.summary_title = generate_title(st.session_state.summary_text)
@@ -492,12 +585,11 @@ if uploaded_file:
         else:
             st.error("❌ Could not extract text from the uploaded file.")
 
-# ---------- Chat input ----------
+# Chat input
 st.markdown("### 💬 Chat / Prompt")
 chat_prompt = st.chat_input("Type a message (ask for 'ppt' or 'slides' to create an outline)...")
 if chat_prompt:
     if st.session_state.summary_text:
-        # If a document exists, allow generating slides from it
         if any(w in chat_prompt.lower() for w in ["ppt", "slides", "presentation"]):
             with st.spinner("Generating outline from document and prompt..."):
                 slides = generate_outline(st.session_state.summary_text + "\n\n" + chat_prompt)
@@ -522,7 +614,7 @@ if chat_prompt:
             st.session_state.messages.append(("assistant", reply))
     st.rerun()
 
-# Optional chat history expanders
+# Chat history expanders
 if st.session_state.get("messages"):
     with st.expander("Recent Chat (local)", expanded=False):
         for role, txt in st.session_state["messages"][-8:]:
@@ -541,11 +633,11 @@ if st.session_state.get("doc_chat_history"):
 
 st.markdown("---")
 
-# ---------- Outline preview + per-slide editing UI ----------
+# Outline preview + per-slide editing UI
 if st.session_state.outline_chat:
     outline = st.session_state.outline_chat
     st.subheader(f"📝 Preview Outline: {outline.get('title', 'Presentation')}")
-    st.write("For each slide: preview content, give feedback, choose format (Full Text / Text & Image), upload an image, and apply edits.")
+    st.write("For each slide: preview content, give feedback, choose format (Full Text / Text & Image / Comparison), upload an image (if needed), and apply edits.")
 
     for idx, slide in enumerate(outline.get("slides", []), start=1):
         with st.expander(f"Slide {idx}: {slide.get('title', '')}", expanded=False):
@@ -564,12 +656,13 @@ if st.session_state.outline_chat:
                 format_key = f"format_{idx}"
                 selected_format = st.selectbox(
                     f"📐 Format for Slide {idx}",
-                    ["Full Text", "Text & Image"],
-                    index=0 if current not in ["Full Text", "Text & Image"] else ["Full Text", "Text & Image"].index(current),
+                    ["Full Text", "Text & Image", "Comparison"],
+                    index=0 if current not in ["Full Text", "Text & Image", "Comparison"] else ["Full Text", "Text & Image", "Comparison"].index(current),
                     key=format_key
                 )
                 st.session_state["slide_formats"][idx] = selected_format
 
+                # If Text & Image selected -> uploader
                 if selected_format == "Text & Image":
                     img_key = f"slide_image_{idx}"
                     uploaded_img = st.file_uploader(f"🖼 Upload image for Slide {idx} (optional)", type=["png", "jpg", "jpeg"], key=img_key)
@@ -586,59 +679,105 @@ if st.session_state.outline_chat:
                             if st.button(f"Remove image for Slide {idx}", key=f"remove_img_{idx}"):
                                 st.session_state["slide_images"].pop(idx, None)
                                 st.success("Image removed.")
-                else:
-                    if st.session_state.get("slide_images", {}).get(idx):
-                        if st.button(f"Remove image for Slide {idx}", key=f"remove_img_ft_{idx}"):
-                            st.session_state["slide_images"].pop(idx, None)
-                            st.success("Image removed.")
+                # Nothing special for Comparison uploader (comparison uses text). If desired, user can still upload images in addition.
 
             with col_right:
                 edit_btn_key = f"edit_btn_{idx}"
                 if st.button(f"💡 Edit Slide {idx}", key=edit_btn_key):
                     with st.spinner(f"Applying feedback to Slide {idx}..."):
-                        prompt_lines = [
-                            "You are an assistant that updates a PowerPoint slide.",
-                            f"Slide Title: {slide.get('title','')}",
-                            "Slide Content:",
-                            slide.get("description", ""),
-                            "",
-                            "User Feedback:",
-                            feedback or "(no feedback provided)",
-                            "",
-                            "Return only the updated bullet points or short paragraph text in the Slide N format:",
-                            "Slide 1: <Title>",
-                            "• <bullet>",
-                            "• <bullet>",
-                            "Do not include any extra commentary."
-                        ]
-                        prompt = "\n".join(prompt_lines)
+                        # tailor prompt for Comparison layout if selected
+                        if selected_format == "Comparison":
+                            # instruct Gemini to return Left:/Right: clearly
+                            prompt = (
+                                "You are an assistant that updates a PowerPoint slide into a two-column comparison.\n"
+                                f"Slide Title: {slide.get('title','')}\n"
+                                f"Current Slide Content:\n{slide.get('description','')}\n\n"
+                                "User Feedback:\n"
+                                f"{feedback or '(no feedback provided)'}\n\n"
+                                "Return the updated content EXACTLY in this machine-friendly format only (no explanation):\n\n"
+                                "Left: <Topic A>\n"
+                                "• <bullet about Topic A>\n"
+                                "• <bullet about Topic A>\n\n"
+                                "Right: <Topic B>\n"
+                                "• <bullet about Topic B>\n"
+                                "• <bullet about Topic B>\n\n"
+                                "Make sure left and right cover the two things being compared. Use 'Left:' and 'Right:' labels exactly as above."
+                            )
+                        else:
+                            prompt_lines = [
+                                "You are an assistant that updates a PowerPoint slide.",
+                                f"Slide Title: {slide.get('title','')}",
+                                "Slide Content:",
+                                slide.get("description", ""),
+                                "",
+                                "User Feedback:",
+                                feedback or "(no feedback provided)",
+                                "",
+                                "Return only the updated bullet points or short paragraph text in the Slide N format:",
+                                "Slide 1: <Title>",
+                                "• <bullet>",
+                                "• <bullet>",
+                                "Do not include any extra commentary."
+                            ]
+                            prompt = "\n".join(prompt_lines)
+
                         result = call_gemini(prompt)
                         parsed = parse_points(result)
+
                         if parsed:
-                            st.session_state.outline_chat["slides"][idx - 1] = parsed[0]
-                            st.success(f"✅ Slide {idx} updated successfully.")
-                            st.rerun()
-                        else:
-                            bullets = []
-                            for l in result.splitlines():
-                                l = l.strip()
-                                if not l:
-                                    continue
-                                cleaned = re.sub(r"^[\-\u2022\*\d\)\.]+\s*", "", l)
-                                if cleaned:
-                                    bullets.append(f"• {cleaned}")
-                            if bullets:
-                                st.session_state.outline_chat["slides"][idx - 1]["description"] = "\n".join(bullets)
-                                st.success(f"✅ Slide {idx} updated (fallback bullets).")
+                            # If comparison format we expect the returned first slide to include Left: and Right: lines in description
+                            if selected_format == "Comparison":
+                                # Take the first parsed slide text and store as slide description (keeps Left: and Right:)
+                                st.session_state.outline_chat["slides"][idx - 1] = parsed[0]
+                                st.success(f"✅ Slide {idx} updated to Comparison format.")
                                 st.rerun()
                             else:
-                                sents = [s.strip() for s in re.split(r"[.!?]\s+", result) if len(s.strip()) > 3]
-                                if sents:
-                                    st.session_state.outline_chat["slides"][idx - 1]["description"] = "\n".join(f"• {s}" for s in sents[:6])
-                                    st.success(f"✅ Slide {idx} updated (sentence fallback).")
+                                st.session_state.outline_chat["slides"][idx - 1] = parsed[0]
+                                st.success(f"✅ Slide {idx} updated successfully.")
+                                st.rerun()
+                        else:
+                            # fallback heuristics: try to extract bullets / left-right manually
+                            if selected_format == "Comparison":
+                                # attempt crude split by 'Right:' marker or '||'
+                                if "Right:" in result:
+                                    # create a single slide record keeping result
+                                    st.session_state.outline_chat["slides"][idx - 1]["description"] = result
+                                    st.success(f"✅ Slide {idx} updated (raw comparison response stored).")
                                     st.rerun()
                                 else:
-                                    st.warning("Could not parse Gemini response. Try rephrasing feedback.")
+                                    # fallback: try split by double newline into two halves
+                                    parts = [p.strip() for p in re.split(r"\n\s*\n", result) if p.strip()]
+                                    if len(parts) >= 2:
+                                        left_block = parts[0]
+                                        right_block = parts[1]
+                                        # create description with Left/Right markers
+                                        new_desc = f"Left: {left_block}\n\nRight: {right_block}"
+                                        st.session_state.outline_chat["slides"][idx - 1]["description"] = new_desc
+                                        st.success(f"✅ Slide {idx} updated (fallback split).")
+                                        st.rerun()
+                                    else:
+                                        st.warning("Could not parse comparison response. Try rephrasing feedback; ask 'compare A and B' explicitly.")
+                            else:
+                                bullets = []
+                                for l in result.splitlines():
+                                    l = l.strip()
+                                    if not l:
+                                        continue
+                                    cleaned = re.sub(r"^[\-\u2022\*\d\)\.]+\s*", "", l)
+                                    if cleaned:
+                                        bullets.append(f"• {cleaned}")
+                                if bullets:
+                                    st.session_state.outline_chat["slides"][idx - 1]["description"] = "\n".join(bullets)
+                                    st.success(f"✅ Slide {idx} updated (fallback bullets).")
+                                    st.rerun()
+                                else:
+                                    sents = [s.strip() for s in re.split(r"[.!?]\s+", result) if len(s.strip()) > 3]
+                                    if sents:
+                                        st.session_state.outline_chat["slides"][idx - 1]["description"] = "\n".join(f"• {s}" for s in sents[:6])
+                                        st.success(f"✅ Slide {idx} updated (sentence fallback).")
+                                        st.rerun()
+                                    else:
+                                        st.warning("Could not parse Gemini response. Try rephrasing your feedback.")
 
     # Outline-level controls
     st.markdown("---")
@@ -646,7 +785,7 @@ if st.session_state.outline_chat:
     new_title = st.text_input("📌 Edit Presentation Title", value=outline.get("title", "Presentation"))
     outline_feedback = st.text_area("✏️ Feedback for the whole outline (optional)", height=140, placeholder="E.g., 'Make slides shorter', 'Add slide on ethics'")
 
-    default_format = st.selectbox("Default Slide Format (applies where per-slide format not set)", ["Full Text", "Text & Image"], index=0 if st.session_state.get("slide_format") not in ["Full Text", "Text & Image"] else ["Full Text", "Text & Image"].index(st.session_state.get("slide_format", "Full Text")))
+    default_format = st.selectbox("Default Slide Format (applies where per-slide format not set)", ["Full Text", "Text & Image", "Comparison"], index=0 if st.session_state.get("slide_format") not in ["Full Text", "Text & Image", "Comparison"] else ["Full Text", "Text & Image", "Comparison"].index(st.session_state.get("slide_format", "Full Text")))
     st.session_state["slide_format"] = default_format
 
     col_apply, col_generate, col_clear = st.columns([1, 1, 1])
@@ -665,7 +804,7 @@ if st.session_state.outline_chat:
     with col_generate:
         if st.button("✅ Generate PPT"):
             with st.spinner("Generating PPT..."):
-                fname = f"{sanitize_filename(new_title or outline.get('title','Presentation'))}.pptx"
+                filename = f"{sanitize_filename(new_title or outline.get('title','Presentation'))}.pptx"
                 if st.session_state.get("theme") == "Dr.Reddys White Master":
                     bg_title = "/mnt/data/360_F_373501182_AW73b2wvfm9wBuar0JYwKBeF8NAUHDOH.jpg"
                     bg_slide = "/mnt/data/pastel-purple-color-solid-background-1920x1080.png"
@@ -678,7 +817,7 @@ if st.session_state.outline_chat:
                 create_ppt(
                     new_title or outline.get("title", "Presentation"),
                     outline.get("slides", []),
-                    fname,
+                    filename,
                     title_size=int(st.session_state.title_size),
                     text_size=int(st.session_state.text_size),
                     font=st.session_state.font_choice,
@@ -691,11 +830,18 @@ if st.session_state.outline_chat:
                 )
 
                 try:
-                    with open(fname, "rb") as f:
-                        st.download_button("⬇️ Download PPT", data=f, file_name=fname, mime="application/vnd.openxmlformats-officedocument.presentationml.presentation")
+                    with open(filename, "rb") as f:
+                        st.download_button("⬇️ Download PPT", data=f, file_name=filename, mime="application/vnd.openxmlformats-officedocument.presentationml.presentation")
                 except Exception as e:
                     st.error(f"Failed to create download: {e}")
 
-    
+    with col_clear:
+        if st.button("🧹 Clear Outline & Selections"):
+            st.session_state.outline_chat = None
+            st.session_state.slide_formats = {}
+            st.session_state.slide_images = {}
+            st.success("Cleared outline, formats and uploaded images.")
+            st.rerun()
 
 # End of file
+
