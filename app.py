@@ -318,11 +318,11 @@ if st.session_state.outline_chat:
 
                 # Pick backgrounds based on theme
                 if st.session_state.theme == "Dr.Reddys White Master":
-                    bg_title = "/mnt/data/360_F_373501182_AW73b2wvfm9wBuar0JYwKBeF8NAUHDOH.jpg"
-                    bg_slide = "/mnt/data/pastel-purple-color-solid-background-1920x1080.png"
+                    bg_title = "Screenshot 2025-10-09 163146.png"
+                    bg_slide = "Screenshot 2025-10-09 163442.png"
                 elif st.session_state.theme == "Dr.Reddys Blue Master":
-                    bg_title = "/mnt/data/studio-background-concept-abstract-empty-light-gradient-purple-studio-room-background-product_1258-52339.jpg"
-                    bg_slide = "/mnt/data/pastel-purple-color-solid-background-1920x1080.png"
+                    bg_title = "Screenshot 2025-10-09 163146.png"
+                    bg_slide = "Screenshot 2025-10-09 163529.png"
                 else:
                     bg_title = bg_slide = None
 
