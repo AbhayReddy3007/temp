@@ -696,12 +696,6 @@ if st.session_state.outline_chat:
                 except Exception as e:
                     st.error(f"Failed to create download: {e}")
 
-    with col_clear:
-        if st.button("🧹 Clear Outline & Selections"):
-            st.session_state.outline_chat = None
-            st.session_state.slide_formats = {}
-            st.session_state.slide_images = {}
-            st.success("Cleared outline, formats and uploaded images.")
-            st.rerun()
+    
 
 # End of file
