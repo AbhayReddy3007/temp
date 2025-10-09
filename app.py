@@ -414,11 +414,7 @@ if st.session_state.outline_chat:
                         f"Slide Title: {slide['title']}\n"
                         f"Slide Content:\n{slide['description']}\n\n"
                         f"Feedback:\n{feedback}\n\n"
-                        f"Return ONLY in this format:\n"
-                        f"Slide 1: <Updated Title>\n"
-                        f"- <Bullet 1>\n"
-                        f"- <Bullet 2>\n"
-                        f"- <Bullet 3>\n""
+                        f"Return the revised slide title and bullet points clearly."
                     )
                     updated_text = call_gemini(prompt)
                     updated_points = parse_points(updated_text)
