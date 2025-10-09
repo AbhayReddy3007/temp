@@ -1,6 +1,5 @@
 # app.py
-# AI PPT Generator with per-slide formats: Full Text / Text & Image / Comparison
-# Includes robust parsing and rendering for comparison slides (two-column layout).
+# AI PPT Generator with improved Comparison slide support (topic detection + concise bullets)
 
 import os
 import re
@@ -17,7 +16,7 @@ from pptx.enum.text import PP_ALIGN
 from pptx.enum.shapes import MSO_SHAPE
 
 # ---------------- CONFIG ----------------
-# Replace with your own Gemini API key or load from environment in production
+# Replace this with an env var in production
 GEMINI_API_KEY = "AIzaSyBtah4ZmuiVkSrJABE8wIjiEgunGXAbT3Q"
 TEXT_MODEL_NAME = "gemini-2.0-flash"
 
@@ -40,7 +39,7 @@ def generate_title(summary: str) -> str:
     result = call_gemini(prompt)
     return result.split("\n")[0] if result else "Presentation"
 
-# ---------------- UTIL: Extract slide count ----------------
+# ---------------- UTIL ----------------
 def extract_slide_count(description: str, default=None):
     if not description:
         return None if default is None else max(1, default - 1)
@@ -50,19 +49,27 @@ def extract_slide_count(description: str, default=None):
         return max(1, total - 1)
     return None if default is None else max(1, default - 1)
 
+def sanitize_filename(name: str) -> str:
+    return re.sub(r'[^A-Za-z0-9_.-]', '_', name).strip("_")
+
+def clean_title_text(title: str) -> str:
+    return re.sub(r"\s+", " ", title.strip()) if title else "Presentation"
+
+def hex_to_rgb(hex_color: str) -> RGBColor:
+    hex_color = hex_color.lstrip("#")
+    if len(hex_color) != 6:
+        hex_color = "000000"
+    return RGBColor(int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16))
+
 # ---------------- PARSING + OUTLINE HELPERS ----------------
 def parse_points(points_text: str):
-    """
-    Parse Gemini output into slides.
-    Returns list of {"title":..., "description": "..."}
-    """
     if not points_text:
         return []
 
     text = points_text.replace("\r\n", "\n").strip()
     slides = []
 
-    # 1) Split on explicit Slide N: headers
+    # 1) Slide N: split
     split_by_slide = re.split(r"\n(?=Slide\s*\d+\s*:)", text, flags=re.IGNORECASE)
     if len(split_by_slide) > 1:
         for block in split_by_slide:
@@ -89,7 +96,7 @@ def parse_points(points_text: str):
             slides.append({"title": title, "description": "\n".join(normalized).strip()})
         return slides
 
-    # 2) Split by double-newline blocks
+    # 2) Double newline sections
     blocks = [b.strip() for b in re.split(r"\n\s*\n", text) if b.strip()]
     if len(blocks) > 1:
         for blk in blocks:
@@ -106,7 +113,7 @@ def parse_points(points_text: str):
             slides.append({"title": title, "description": "\n".join(rest).strip()})
         return slides
 
-    # 3) If many short lines, treat each as a slide title
+    # 3) short lines -> titles
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     if lines:
         short_lines = [ln for ln in lines if len(ln.split()) <= 8]
@@ -115,7 +122,7 @@ def parse_points(points_text: str):
                 slides.append({"title": ln, "description": ""})
             return slides
 
-    # 4) Last resort: single slide with first line as title
+    # 4) fallback single slide
     if lines:
         title = lines[0]
         body = "\n".join(lines[1:]) if len(lines) > 1 else ""
@@ -151,8 +158,7 @@ def generate_outline(description: str):
         "\n"
         "Slide 3: <Title>\n"
         "• <bullet 1>\n"
-        "... and so on for every slide.\n\n"
-        "Do NOT include any extra text, explanation, or numbered lists. Use 'Slide N:' headers exactly as above and use bullets starting with '•' or '-' for bullet points."
+        "... and so on."
     )
     outline_text = call_gemini(prompt)
     slides = parse_points(outline_text)
@@ -178,14 +184,7 @@ def edit_outline_with_feedback(outline, feedback: str):
         f"{outline_text}\n\n"
         "Feedback:\n"
         f"{feedback}\n\n"
-        "IMPORTANT: Return the entire updated outline in the exact same machine-friendly format as:\n"
-        "Slide 1: <Title>\n"
-        "• <bullet 1>\n"
-        "• <bullet 2>\n\n"
-        "Slide 2: <Title>\n"
-        "• <bullet>\n"
-        "...\n"
-        "Do NOT include commentary. Return only the updated outline."
+        "IMPORTANT: Return the entire updated outline in the same machine-friendly format (Slide N: ...)."
     )
     updated = call_gemini(prompt)
     updated_slides = parse_points(updated)
@@ -194,7 +193,7 @@ def edit_outline_with_feedback(outline, feedback: str):
         updated_slides = parse_points(retry)
     return {"title": outline.get("title", "Presentation"), "slides": updated_slides}
 
-# ---------------- LONG TEXT SUMMARIZATION ----------------
+# ---------------- long text summarization ----------------
 def split_text(text: str, chunk_size: int = 8000, overlap: int = 300):
     chunks = []
     start = 0
@@ -219,7 +218,7 @@ def summarize_long_text(full_text: str) -> str:
     combined = call_gemini("Combine these analyses into a detailed summary:\n\n" + "\n\n".join(analyses))
     return combined
 
-# ---------------- FILE / TEXT EXTRACTION HELPERS ----------------
+# ---------------- file helpers ----------------
 def extract_text(path: str, filename: str) -> str:
     name = filename.lower()
     try:
@@ -240,39 +239,103 @@ def extract_text(path: str, filename: str) -> str:
         return ""
     return ""
 
-def sanitize_filename(name: str) -> str:
-    return re.sub(r'[^A-Za-z0-9_.-]', '_', name).strip("_")
+# ---------------- Comparison parsing & helpers ----------------
+def extract_topics_from_feedback(feedback: str):
+    """
+    Attempt to extract two topics from feedback like:
+     - "compare A and B"
+     - "A vs B"
+     - "Compare A with B"
+    Returns tuple (topicA, topicB) or (None,None)
+    """
+    if not feedback:
+        return None, None
+    s = feedback.strip()
+    # vs pattern
+    m = re.search(r"([A-Za-z0-9 &\-\+\']{2,80})\s+vs\.?\s+([A-Za-z0-9 &\-\+\']{2,80})", s, re.IGNORECASE)
+    if m:
+        return m.group(1).strip(), m.group(2).strip()
+    m2 = re.search(r"compare\s+(.+?)\s+(?:and|with|vs\.?)\s+(.+)", s, re.IGNORECASE)
+    if m2:
+        a = m2.group(1).strip().strip(",:;")
+        b = m2.group(2).strip().strip(",:;")
+        return a, b
+    return None, None
 
-def clean_title_text(title: str) -> str:
-    return re.sub(r"\s+", " ", title.strip()) if title else "Presentation"
+def infer_topics_from_title(title: str):
+    """
+    If slide title contains 'A vs B' or 'A vs. B' or 'A vs B', extract topics.
+    """
+    if not title:
+        return None, None
+    m = re.search(r"(.+?)\s+vs\.?\s+(.+)", title, re.IGNORECASE)
+    if m:
+        return m.group(1).strip(), m.group(2).strip()
+    return None, None
 
-def hex_to_rgb(hex_color: str) -> RGBColor:
-    hex_color = hex_color.lstrip("#")
-    if len(hex_color) != 6:
-        hex_color = "000000"
-    return RGBColor(int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16))
+def split_long_line_into_bullets(line: str, max_words: int = 12):
+    """
+    Heuristic: if a line is long, split on ';' or ' — ' or commas, or sentences.
+    Keep pieces with <= max_words when possible.
+    Returns list of shorter strings.
+    """
+    if not line:
+        return []
+    line = line.strip()
+    # If already short, return
+    if len(line.split()) <= max_words:
+        return [line]
+    # split on semicolon or ' - ' or ' — '
+    for sep in [";", "—", " - ", " – "]:
+        if sep in line:
+            parts = [p.strip() for p in line.split(sep) if p.strip()]
+            out = []
+            for p in parts:
+                if len(p.split()) > max_words:
+                    out.extend(split_long_line_into_bullets(p, max_words))
+                else:
+                    out.append(p)
+            if out:
+                return out
+    # split on sentences
+    parts = [p.strip() for p in re.split(r'(?<=[.!?])\s+', line) if p.strip()]
+    if len(parts) > 1:
+        out = []
+        for p in parts:
+            if len(p.split()) > max_words:
+                out.extend(split_long_line_into_bullets(p, max_words))
+            else:
+                out.append(p)
+        return out
+    # as last resort split by commas
+    if "," in line:
+        parts = [p.strip() for p in line.split(",") if p.strip()]
+        out = []
+        for p in parts:
+            if len(p.split()) > max_words:
+                out.extend(split_long_line_into_bullets(p, max_words))
+            else:
+                out.append(p)
+        return out
+    # cannot split further
+    return [line]
 
-# ---------------- COMPARISON PARSER ----------------
 def parse_comparison_block(description: str):
     """
-    Parse a description expected to contain a comparison and return:
-      (left_title, left_bullets_list, right_title, right_bullets_list)
-
-    Accepts explicit Left:/Right:, "A vs B", double-blocks, or falls back to splitting.
+    Parse a description expected to contain a comparison:
+    Return left_title, left_bullets(list), right_title, right_bullets(list)
     """
     left_title = ""
     right_title = ""
     left_lines = []
     right_lines = []
-
     if not description or not description.strip():
-        return ("Left", [], "Right", [])
+        return left_title or "Left", [], right_title or "Right", []
 
-    # Normalize and collect non-empty lines
-    lines_raw = [ln.rstrip() for ln in description.replace("\r\n", "\n").split("\n")]
+    raw = description.replace("\r\n", "\n")
+    lines_raw = [ln.rstrip() for ln in raw.split("\n")]
     lines = [ln.strip() for ln in lines_raw if ln.strip()]
 
-    # 1) Direct Left:/Right: markers
     mode = None
     for ln in lines:
         mleft = re.match(r"^Left\s*:\s*(.+)$", ln, re.IGNORECASE)
@@ -285,8 +348,7 @@ def parse_comparison_block(description: str):
             mode = "right"
             right_title = mright.group(1).strip()
             continue
-
-        # bullets (starting with -, •, * or numbered)
+        # bullets
         if re.match(r"^[\-\u2022\*]\s+", ln) or re.match(r"^\d+\.", ln):
             cleaned = re.sub(r"^[\-\u2022\*]\s*|^\d+\.\s*", "", ln).strip()
             if mode == "right":
@@ -294,89 +356,91 @@ def parse_comparison_block(description: str):
             else:
                 left_lines.append(cleaned)
             continue
-
-        # "Topic A vs Topic B"
+        # vs-line detection
         if re.search(r'\bvs\.?\b|\bversus\b|\bv\b', ln, re.IGNORECASE) and not left_title and not right_title:
             parts = re.split(r'\s+vs\.?\s+|\s+v\.?\s+|\s+versus\s+', ln, flags=re.IGNORECASE)
             if len(parts) == 2:
                 left_title = parts[0].strip()
                 right_title = parts[1].strip()
             continue
-
-        # Titles by mode
+        # Titles if mode set
         if mode == "left" and not left_title:
             left_title = ln
             continue
         if mode == "right" and not right_title:
             right_title = ln
             continue
-
-        # Short-line heuristics for titles
+        # heuristics for short lines as titles
         if len(ln.split()) <= 6 and not left_title:
             left_title = ln
             continue
         if len(ln.split()) <= 6 and left_title and not right_title:
             right_title = ln
             continue
-
-        # else treat as bullet for active mode else left
+        # default append
         if mode == "right":
             right_lines.append(ln)
         else:
             left_lines.append(ln)
 
-    # 2) If right missing, attempt splits
-    if (not right_lines and not right_title) and left_lines:
-        raw_join = "\n".join(lines_raw)
-        if "Right:" in raw_join:
-            m = re.search(r"Right\s*:\s*(.+)", raw_join, re.IGNORECASE | re.DOTALL)
+    # fallback: if both titles empty and description contains "A vs B" in the slide's content
+    if (not left_title and not right_title):
+        for ln in lines:
+            m = re.search(r"(.+?)\s+vs\.?\s+(.+)", ln, re.IGNORECASE)
             if m:
-                right_block = m.group(1).strip()
-                right_candidates = [ln.strip() for ln in right_block.splitlines() if ln.strip()]
-                if len(right_candidates) > 0:
-                    right_title = right_title or right_candidates[0]
-                    for ln in right_candidates[1:]:
-                        if re.match(r"^[\-\u2022\*]\s+|\d+\.", ln):
-                            right_lines.append(re.sub(r"^[\-\u2022\*]\s*|^\d+\.\s*", "", ln).strip())
-                        else:
-                            right_lines.append(ln.strip())
-        if not right_lines and not right_title:
-            blocks = [b.strip() for b in re.split(r"\n\s*\n", description) if b.strip()]
-            if len(blocks) >= 2:
-                bleft = blocks[0].splitlines()
-                bright = blocks[1].splitlines()
-                if bleft:
-                    if not left_title and bleft[0].strip():
-                        left_title = left_title or bleft[0].strip()
-                        bleft = bleft[1:]
-                    for ln in bleft:
-                        ln = ln.strip()
-                        if not ln: continue
-                        ln = re.sub(r"^[\-\u2022\*]\s*|^\d+\.\s*", "", ln).strip()
-                        left_lines.append(ln)
-                if bright:
-                    if not right_title and bright[0].strip():
-                        right_title = right_title or bright[0].strip()
-                        bright = bright[1:]
-                    for ln in bright:
-                        ln = ln.strip()
-                        if not ln: continue
-                        ln = re.sub(r"^[\-\u2022\*]\s*|^\d+\.\s*", "", ln).strip()
-                        right_lines.append(ln)
-        if not right_lines:
+                left_title = m.group(1).strip()
+                right_title = m.group(2).strip()
+                break
+
+    # fallback: if right missing, try block splitting
+    if (not right_lines and not right_title) and left_lines:
+        blocks = [b.strip() for b in re.split(r"\n\s*\n", raw) if b.strip()]
+        if len(blocks) >= 2:
+            bleft = blocks[0].splitlines()
+            bright = blocks[1].splitlines()
+            if bleft:
+                if not left_title and bleft[0].strip():
+                    left_title = left_title or bleft[0].strip()
+                    bleft = bleft[1:]
+                for ln in bleft:
+                    ln = ln.strip()
+                    if not ln: continue
+                    ln = re.sub(r"^[\-\u2022\*]\s*|^\d+\.\s*", "", ln).strip()
+                    left_lines.append(ln)
+            if bright:
+                if not right_title and bright[0].strip():
+                    right_title = right_title or bright[0].strip()
+                    bright = bright[1:]
+                for ln in bright:
+                    ln = ln.strip()
+                    if not ln: continue
+                    ln = re.sub(r"^[\-\u2022\*]\s*|^\d+\.\s*", "", ln).strip()
+                    right_lines.append(ln)
+        else:
+            # split half
             if len(left_lines) >= 2:
                 mid = len(left_lines) // 2
                 right_lines = left_lines[mid:]
                 left_lines = left_lines[:mid]
-                right_title = right_title or "Right"
                 left_title = left_title or "Left"
+                right_title = right_title or "Right"
 
+    # finalize default titles
     left_title = left_title or "Left"
     right_title = right_title or "Right"
-    left_lines = [l.strip() for l in left_lines if l.strip()]
-    right_lines = [l.strip() for l in right_lines if l.strip()]
 
-    return left_title, left_lines, right_title, right_lines
+    # split long lines into multiple bullets for readability
+    left_final = []
+    for ln in left_lines:
+        left_final.extend(split_long_line_into_bullets(ln, max_words=12))
+    right_final = []
+    for ln in right_lines:
+        right_final.extend(split_long_line_into_bullets(ln, max_words=12))
+
+    left_final = [l for l in left_final if l]
+    right_final = [r for r in right_final if r]
+
+    return left_title, left_final, right_title, right_final
 
 # ---------------- PPT CREATION ----------------
 def _add_image_to_slide(slide, image_bytes, left, top, width=None, height=None):
@@ -436,9 +500,10 @@ def create_ppt(title, points, filename="output.pptx", title_size=30, text_size=2
         slide = prs.slides.add_slide(prs.slide_layouts[5])
         set_bg(slide, bg_slide_path)
 
-        # Title
-        tb_title = slide.shapes.add_textbox(Inches(0.8), Inches(0.4), Inches(8.0), Inches(1.0))
+        # Slide Title
+        tb_title = slide.shapes.add_textbox(Inches(0.8), Inches(0.3), Inches(8.0), Inches(1.0))
         tf_title = tb_title.text_frame
+        tf_title.clear()
         p_title = tf_title.add_paragraph()
         p_title.text = key_point
         p_title.font.size = Pt(title_size)
@@ -455,7 +520,6 @@ def create_ppt(title, points, filename="output.pptx", title_size=30, text_size=2
                 else:
                     tb_body = slide.shapes.add_textbox(Inches(1), Inches(1.6), Inches(8.0), Inches(4.0))
                 tf_body = tb_body.text_frame
-                # clear default content
                 try:
                     tf_body.text = ""
                 except Exception:
@@ -463,21 +527,20 @@ def create_ppt(title, points, filename="output.pptx", title_size=30, text_size=2
                 tf_body.word_wrap = True
                 for line in description.splitlines():
                     if line.strip():
-                        p_body = tf_body.add_paragraph()
-                        p_body.text = line.strip("•-* ").strip()
-                        p_body.font.size = Pt(text_size)
-                        p_body.font.name = font
-                        p_body.font.color.rgb = hex_to_rgb(text_color)
-                        p_body.level = 0
+                        for b in split_long_line_into_bullets(line, max_words=12):
+                            p_body = tf_body.add_paragraph()
+                            p_body.text = b.strip("•-* ").strip()
+                            p_body.font.size = Pt(text_size)
+                            p_body.font.name = font
+                            p_body.font.color.rgb = hex_to_rgb(text_color)
+                            p_body.level = 0
 
-            # Text & Image right side
             if slide_format == "Text & Image":
                 img_bytes = st.session_state.get("slide_images", {}).get(idx)
                 if img_bytes:
                     left = Inches(6.0); top = Inches(1.6); width = Inches(3.0)
                     _add_image_to_slide(slide, img_bytes, left, top, width=width)
                 else:
-                    # placeholder
                     left = Inches(6.0); top = Inches(1.6); width = Inches(3.0); height = Inches(3.0)
                     try:
                         shape = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, left, top, width, height)
@@ -488,11 +551,20 @@ def create_ppt(title, points, filename="output.pptx", title_size=30, text_size=2
                     except Exception:
                         pass
 
-        # Comparison layout: two columns
+        # Comparison layout
         elif slide_format == "Comparison":
-            left_title, left_lines, right_title, right_lines = parse_comparison_block(description or "")
+            # Try to infer topics from feedback or title stored in description if possible
+            # parse comparison block
+            left_title, left_bullets, right_title, right_bullets = parse_comparison_block(description or "")
 
-            # Left title
+            # If parser returned generic 'Left'/'Right', attempt to infer from slide title
+            if left_title.lower() == "left" or right_title.lower() == "right":
+                a, b = infer_topics_from_title(key_point)
+                if a and b:
+                    left_title = left_title if left_title.lower() != "left" else a
+                    right_title = right_title if right_title.lower() != "right" else b
+
+            # Left column title
             tb_left_title = slide.shapes.add_textbox(Inches(0.6), Inches(1.2), Inches(4.0), Inches(0.7))
             tf_lt = tb_left_title.text_frame
             try:
@@ -515,8 +587,8 @@ def create_ppt(title, points, filename="output.pptx", title_size=30, text_size=2
             except Exception:
                 pass
             tf_left.word_wrap = True
-            if left_lines:
-                for ln in left_lines:
+            if left_bullets:
+                for ln in left_bullets:
                     p = tf_left.add_paragraph()
                     p.text = f"• {ln}"
                     p.font.size = Pt(text_size)
@@ -530,7 +602,7 @@ def create_ppt(title, points, filename="output.pptx", title_size=30, text_size=2
                 p.font.name = font
                 p.font.color.rgb = hex_to_rgb(text_color)
 
-            # Right title
+            # Right column title
             tb_right_title = slide.shapes.add_textbox(Inches(5.2), Inches(1.2), Inches(4.0), Inches(0.7))
             tf_rt = tb_right_title.text_frame
             try:
@@ -553,8 +625,8 @@ def create_ppt(title, points, filename="output.pptx", title_size=30, text_size=2
             except Exception:
                 pass
             tf_right.word_wrap = True
-            if right_lines:
-                for ln in right_lines:
+            if right_bullets:
+                for ln in right_bullets:
                     p = tf_right.add_paragraph()
                     p.text = f"• {ln}"
                     p.font.size = Pt(text_size)
@@ -587,9 +659,9 @@ def create_ppt(title, points, filename="output.pptx", title_size=30, text_size=2
 
 # ---------------- STREAMLIT UI ----------------
 st.set_page_config(page_title="AI PPT Generator", layout="wide")
-st.title("🧠 AI PPT Generator — Full Text / Text & Image / Comparison")
+st.title("🧠 AI PPT Generator — Improved Comparison Slides")
 
-# session state defaults
+# session defaults
 _defaults = {
     "messages": [],
     "doc_chat_history": [],
@@ -611,7 +683,7 @@ for k, v in _defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
-# ---------- Customization ----------
+# customization
 st.subheader("🎨 Customize PPT Style")
 col1, col2 = st.columns(2)
 with col1:
@@ -641,7 +713,7 @@ st.session_state.theme = st.selectbox(
 
 st.markdown("---")
 
-# ---------- Upload document ----------
+# upload doc
 st.markdown("### 📄 Upload a document (optional) — PDF, DOCX, TXT")
 uploaded_file = st.file_uploader("Upload a document to generate slides from", type=["pdf", "docx", "txt"])
 if uploaded_file:
@@ -659,11 +731,11 @@ if uploaded_file:
         if text and text.strip():
             st.session_state.summary_text = summarize_long_text(text)
             st.session_state.summary_title = generate_title(st.session_state.summary_text)
-            st.success("✅ Document processed. You can now ask to generate slides (type 'ppt' or 'slides').")
+            st.success("✅ Document processed.")
         else:
             st.error("❌ Could not extract text from the uploaded file.")
 
-# ---------- Chat input ----------
+# chat input
 st.markdown("### 💬 Chat / Prompt")
 chat_prompt = st.chat_input("Type a message (ask for 'ppt' or 'slides' to create an outline)...")
 if chat_prompt:
@@ -692,7 +764,7 @@ if chat_prompt:
             st.session_state.messages.append(("assistant", reply))
     st.rerun()
 
-# Chat history expanders
+# show chat history
 if st.session_state.get("messages"):
     with st.expander("Recent Chat (local)", expanded=False):
         for role, txt in st.session_state["messages"][-8:]:
@@ -711,14 +783,14 @@ if st.session_state.get("doc_chat_history"):
 
 st.markdown("---")
 
-# ---------- Outline preview + per-slide editing UI ----------
+# Outline preview + edits
 if st.session_state.outline_chat:
     outline = st.session_state.outline_chat
     st.subheader(f"📝 Preview Outline: {outline.get('title', 'Presentation')}")
-    st.write("For each slide: preview content, give feedback, choose format (Full Text / Text & Image / Comparison), upload an image (if needed), and apply edits.")
+    st.write("Per-slide: preview, give feedback, set format (Full Text / Text & Image / Comparison), upload image, apply edits.")
 
     for idx, slide in enumerate(outline.get("slides", []), start=1):
-        with st.expander(f"Slide {idx}: {slide.get('title', '')}", expanded=False):
+        with st.expander(f"Slide {idx}: {slide.get('title','')}", expanded=False):
             desc = slide.get("description", "")
             if desc:
                 st.markdown(desc.replace("\n", "\n\n"))
@@ -756,30 +828,54 @@ if st.session_state.outline_chat:
                             if st.button(f"Remove image for Slide {idx}", key=f"remove_img_{idx}"):
                                 st.session_state["slide_images"].pop(idx, None)
                                 st.success("Image removed.")
-                # For Comparison, no image uploader by default (but you could extend to allow per-column images)
 
             with col_right:
                 edit_btn_key = f"edit_btn_{idx}"
                 if st.button(f"💡 Edit Slide {idx}", key=edit_btn_key):
                     with st.spinner(f"Applying feedback to Slide {idx}..."):
-                        # tailor prompt for Comparison layout if selected
+                        # If Comparison: try to extract topics from feedback or slide title
+                        topicA, topicB = extract_topics_from_feedback(feedback)
+                        if not topicA or not topicB:
+                            # try title
+                            tA, tB = infer_topics_from_title(slide.get("title",""))
+                            if tA and tB:
+                                topicA, topicB = topicA or tA, topicB or tB
+
                         if selected_format == "Comparison":
-                            prompt = (
-                                "You are an assistant that updates a PowerPoint slide into a two-column comparison.\n"
+                            # strong instruction: produce Left/Right with concise bullets
+                            comp_prompt = (
+                                "You are an assistant that produces a clear two-column comparison for a PowerPoint slide.\n"
                                 f"Slide Title: {slide.get('title','')}\n"
-                                f"Current Slide Content:\n{slide.get('description','')}\n\n"
-                                "User Feedback:\n"
-                                f"{feedback or '(no feedback provided)'}\n\n"
-                                "Return the updated content EXACTLY in this machine-friendly format only (no explanation):\n\n"
+                                f"Current Content: {slide.get('description','')}\n\n"
+                                f"User Feedback: {feedback or '(no feedback)'}\n\n"
+                                "If the user asked to compare two specific topics, ensure Left: and Right: use those topics as column titles.\n"
+                                "Return output EXACTLY in this machine-friendly format and nothing else:\n\n"
                                 "Left: <Topic A>\n"
-                                "• <bullet about Topic A>\n"
-                                "• <bullet about Topic A>\n\n"
+                                "• <concise bullet 1 about Topic A>\n"
+                                "• <concise bullet 2 about Topic A>\n"
+                                "• <concise bullet 3 about Topic A>\n"
+                                "• <concise bullet 4 about Topic A>\n\n"
                                 "Right: <Topic B>\n"
-                                "• <bullet about Topic B>\n"
-                                "• <bullet about Topic B>\n\n"
-                                "Make sure left and right cover the two things being compared. Use 'Left:' and 'Right:' labels exactly as above."
+                                "• <concise bullet 1 about Topic B>\n"
+                                "• <concise bullet 2 about Topic B>\n"
+                                "• <concise bullet 3 about Topic B>\n"
+                                "• <concise bullet 4 about Topic B>\n\n"
+                                "Bullets should be short (ideally <= 10 words). Use 'Left:' and 'Right:' labels exactly."
                             )
+                            # If we inferred topics, give explicit hint
+                            if topicA and topicB:
+                                comp_prompt = f"Please compare '{topicA}' (Left) and '{topicB}' (Right).\n\n" + comp_prompt
+                            result = call_gemini(comp_prompt)
+                            # parse result: if parse_points can handle Slide headers, else store raw
+                            # We'll keep result as description (parse_comparison_block will later parse)
+                            if result:
+                                st.session_state.outline_chat["slides"][idx - 1]["description"] = result
+                                st.success(f"✅ Comparison slide {idx} updated.")
+                                st.rerun()
+                            else:
+                                st.warning("No response from the model. Try again.")
                         else:
+                            # non-comparison: reuse previous logic to request an updated slide body
                             prompt_lines = [
                                 "You are an assistant that updates a PowerPoint slide.",
                                 f"Slide Title: {slide.get('title','')}",
@@ -789,83 +885,45 @@ if st.session_state.outline_chat:
                                 "User Feedback:",
                                 feedback or "(no feedback provided)",
                                 "",
-                                "Return only the updated bullet points or short paragraph text in the Slide N format:",
-                                "Slide 1: <Title>",
-                                "• <bullet>",
-                                "• <bullet>",
-                                "Do not include any extra commentary."
+                                "Return only the updated bullet points or short paragraph text in a simple format."
                             ]
                             prompt = "\n".join(prompt_lines)
-
-                        result = call_gemini(prompt)
-                        parsed = parse_points(result)
-
-                        if parsed:
-                            # For comparison, we keep the parsed first slide (which may include Left/Right)
-                            st.session_state.outline_chat["slides"][idx - 1] = parsed[0]
-                            st.success(f"✅ Slide {idx} updated successfully.")
-                            st.rerun()
-                        else:
-                            # Fallbacks
-                            if selected_format == "Comparison":
-                                if "Right:" in result:
-                                    st.session_state.outline_chat["slides"][idx - 1]["description"] = result
-                                    st.success(f"✅ Slide {idx} updated (raw comparison response stored).")
-                                    st.rerun()
-                                else:
-                                    parts = [p.strip() for p in re.split(r"\n\s*\n", result) if p.strip()]
-                                    if len(parts) >= 2:
-                                        left_block = parts[0]
-                                        right_block = parts[1]
-                                        new_desc = f"Left: {left_block}\n\nRight: {right_block}"
-                                        st.session_state.outline_chat["slides"][idx - 1]["description"] = new_desc
-                                        st.success(f"✅ Slide {idx} updated (fallback split).")
-                                        st.rerun()
-                                    else:
-                                        st.warning("Could not parse comparison response. Try rephrasing feedback; ask 'compare X and Y' explicitly.")
+                            result = call_gemini(prompt)
+                            parsed = parse_points(result)
+                            if parsed:
+                                st.session_state.outline_chat["slides"][idx - 1] = parsed[0]
+                                st.success(f"✅ Slide {idx} updated.")
+                                st.rerun()
                             else:
-                                bullets = []
-                                for l in result.splitlines():
-                                    l = l.strip()
-                                    if not l:
-                                        continue
-                                    cleaned = re.sub(r"^[\-\u2022\*\d\)\.]+\s*", "", l)
-                                    if cleaned:
-                                        bullets.append(f"• {cleaned}")
-                                if bullets:
-                                    st.session_state.outline_chat["slides"][idx - 1]["description"] = "\n".join(bullets)
-                                    st.success(f"✅ Slide {idx} updated (fallback bullets).")
+                                # fallback: store raw as description
+                                if result and result.strip():
+                                    st.session_state.outline_chat["slides"][idx - 1]["description"] = result
+                                    st.success(f"✅ Slide {idx} updated (stored raw).")
                                     st.rerun()
                                 else:
-                                    sents = [s.strip() for s in re.split(r"[.!?]\s+", result) if len(s.strip()) > 3]
-                                    if sents:
-                                        st.session_state.outline_chat["slides"][idx - 1]["description"] = "\n".join(f"• {s}" for s in sents[:6])
-                                        st.success(f"✅ Slide {idx} updated (sentence fallback).")
-                                        st.rerun()
-                                    else:
-                                        st.warning("Could not parse Gemini response. Try rephrasing your feedback.")
+                                    st.warning("Could not parse Gemini response. Try rephrasing feedback.")
 
     # Outline-level controls
     st.markdown("---")
     st.subheader("Outline Controls")
     new_title = st.text_input("📌 Edit Presentation Title", value=outline.get("title", "Presentation"))
-    outline_feedback = st.text_area("✏️ Feedback for the whole outline (optional)", height=140, placeholder="E.g., 'Make slides shorter', 'Add slide on ethics'")
+    outline_feedback = st.text_area("✏️ Feedback for the whole outline (optional)", height=140)
 
-    default_format = st.selectbox("Default Slide Format (applies where per-slide format not set)", ["Full Text", "Text & Image", "Comparison"], index=0 if st.session_state.get("slide_format") not in ["Full Text", "Text & Image", "Comparison"] else ["Full Text", "Text & Image", "Comparison"].index(st.session_state.get("slide_format", "Full Text")))
+    default_format = st.selectbox("Default Slide Format", ["Full Text", "Text & Image", "Comparison"], index=0 if st.session_state.get("slide_format") not in ["Full Text", "Text & Image", "Comparison"] else ["Full Text", "Text & Image", "Comparison"].index(st.session_state.get("slide_format", "Full Text")))
     st.session_state["slide_format"] = default_format
 
     col_apply, col_generate, col_clear = st.columns([1, 1, 1])
     with col_apply:
         if st.button("🔄 Apply Feedback (outline-level)"):
-            with st.spinner("Updating outline with feedback..."):
+            with st.spinner("Updating outline..."):
                 updated = edit_outline_with_feedback(outline, outline_feedback)
                 if updated and updated.get("slides"):
                     updated["title"] = new_title.strip() if new_title else updated.get("title", "Presentation")
                     st.session_state.outline_chat = updated
-                    st.success("✅ Outline updated with feedback.")
+                    st.success("✅ Outline updated.")
                     st.rerun()
                 else:
-                    st.warning("No changes returned. Try rephrasing feedback or making feedback more specific.")
+                    st.warning("No changes returned. Try rephrasing feedback.")
 
     with col_generate:
         if st.button("✅ Generate PPT"):
@@ -908,3 +966,5 @@ if st.session_state.outline_chat:
             st.session_state.slide_images = {}
             st.success("Cleared outline, formats and uploaded images.")
             st.rerun()
+
+# end of file
