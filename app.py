@@ -579,8 +579,7 @@ def create_ppt(title, points, filename="output.pptx", title_size=30, text_size=2
             tf.text = ""
         except Exception:
             pass
-    p = tf.add_paragraph()
-    p.text = date.today().strftime("%Y-%m-%d")              
+    p = tf.add_paragraph()             
     p.text = title
     p.font.size = Pt(title_size)
     p.font.bold = True
