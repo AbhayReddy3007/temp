@@ -880,7 +880,7 @@ if uploaded_file:
 
 # chat input
 
-chat_prompt = st.chat_input("Type a message (ask for 'ppt' or 'slides' to create an outline)...")
+chat_prompt = st.chat_input("Enter prompt")
 if chat_prompt:
     if st.session_state.summary_text:
         if any(w in chat_prompt.lower() for w in ["ppt", "slides", "presentation"]):
@@ -1050,7 +1050,7 @@ if st.session_state.outline_chat:
     st.markdown("---")
     st.subheader("Outline Controls")
     new_title = st.text_input("📌 Edit Presentation Title", value=outline.get("title", "Presentation"))
-    outline_feedback = st.text_area("✏️ Feedback for the whole outline (optional)", height=140)
+    outline_feedback = st.text_area("✏️ Feedback ", height=140)
 
     default_format = st.selectbox("Default Slide Format", ["Full Text", "Text & Image", "Comparison"], index=0 if st.session_state.get("slide_format") not in ["Full Text", "Text & Image", "Comparison"] else ["Full Text", "Text & Image", "Comparison"].index(st.session_state.get("slide_format", "Full Text")))
     st.session_state["slide_format"] = default_format
