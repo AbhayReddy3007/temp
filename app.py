@@ -537,6 +537,18 @@ def create_ppt(title, points, filename="output.pptx", title_size=30, text_size=2
                font="Calibri", title_color="#5E2A84", text_color="#282828",
                background_color="#FFFFFF", theme="Custom",
                bg_title_path=None, bg_slide_path=None):
+    """
+    Create a PPTX file from `points` where each point is a dict:
+      {"title": "...", "description": "..."}
+    Supports per-slide formats stored in st.session_state["slide_formats"][idx] with values:
+      "Full Text", "Text & Image", "Comparison"
+    and per-slide uploaded images in st.session_state["slide_images"][idx] (bytes).
+    Relies on helper functions available in the module:
+      - hex_to_rgb(hex_color) -> RGBColor
+      - _add_image_to_slide(slide, image_bytes, left, top, width=None, height=None)
+      - split_long_line_into_bullets(text, max_words=12) -> list[str]
+      - parse_comparison_block(description) -> (left_title, left_bullets, right_title, right_bullets)
+    """
     prs = Presentation()
     title = clean_title_text(title)
 
@@ -559,6 +571,13 @@ def create_ppt(title, points, filename="output.pptx", title_size=30, text_size=2
     tb = slide.shapes.add_textbox(Inches(1), Inches(1.6), Inches(8.5), Inches(2.2))
     tf = tb.text_frame
     tf.word_wrap = True
+    try:
+        tf.clear()
+    except Exception:
+        try:
+            tf.text = ""
+        except Exception:
+            pass
     p = tf.add_paragraph()
     p.text = title
     p.font.size = Pt(title_size)
@@ -570,16 +589,22 @@ def create_ppt(title, points, filename="output.pptx", title_size=30, text_size=2
     # Content slides
     for idx, item in enumerate(points, start=1):
         key_point = clean_title_text(item.get("title", f"Slide {idx}"))
-        description = item.get("description", "")
+        description = item.get("description", "") or ""
         slide_format = st.session_state.get("slide_formats", {}).get(idx, st.session_state.get("slide_format", "Full Text"))
 
         slide = prs.slides.add_slide(prs.slide_layouts[5])
         set_bg(slide, bg_slide_path)
 
-        # Slide Title
-        tb_title = slide.shapes.add_textbox(Inches(0.8), Inches(0.3), Inches(8.0), Inches(1.0))
+        # Slide title
+        tb_title = slide.shapes.add_textbox(Inches(0.8), Inches(0.4), Inches(8.0), Inches(1.0))
         tf_title = tb_title.text_frame
-        tf_title.clear()
+        try:
+            tf_title.clear()
+        except Exception:
+            try:
+                tf_title.text = ""
+            except Exception:
+                pass
         p_title = tf_title.add_paragraph()
         p_title.text = key_point
         p_title.font.size = Pt(title_size)
@@ -588,29 +613,44 @@ def create_ppt(title, points, filename="output.pptx", title_size=30, text_size=2
         p_title.font.color.rgb = hex_to_rgb(title_color)
         p_title.alignment = PP_ALIGN.LEFT
 
-        # Full Text / Text & Image
+        # ---------- Full Text / Text & Image ----------
         if slide_format in ("Full Text", "Text & Image"):
             if description:
                 if slide_format == "Text & Image":
                     tb_body = slide.shapes.add_textbox(Inches(1), Inches(1.6), Inches(5.0), Inches(4.0))
                 else:
                     tb_body = slide.shapes.add_textbox(Inches(1), Inches(1.6), Inches(8.0), Inches(4.0))
+
                 tf_body = tb_body.text_frame
                 try:
-                    tf_body.text = ""
+                    tf_body.clear()
                 except Exception:
-                    pass
+                    try:
+                        tf_body.text = ""
+                    except Exception:
+                        pass
                 tf_body.word_wrap = True
-                for line in description.splitlines():
-                    if line.strip():
-                        for b in split_long_line_into_bullets(line, max_words=12):
-                            p_body = tf_body.add_paragraph()
-                            p_body.text = b.strip("•-* ").strip()
-                            p_body.font.size = Pt(text_size)
-                            p_body.font.name = font
-                            p_body.font.color.rgb = hex_to_rgb(text_color)
-                            p_body.level = 0
 
+                # Ensure each point shows with a visible dot bullet
+                for line in description.splitlines():
+                    if not line.strip():
+                        continue
+                    text_line = line.strip()
+                    if text_line.startswith("•"):
+                        display_text = text_line
+                    elif text_line.startswith(("-", "*")):
+                        display_text = "• " + text_line.lstrip("-* ").strip()
+                    else:
+                        display_text = "• " + text_line
+
+                    p_body = tf_body.add_paragraph()
+                    p_body.text = display_text
+                    p_body.font.size = Pt(text_size)
+                    p_body.font.name = font
+                    p_body.font.color.rgb = hex_to_rgb(text_color)
+                    p_body.level = 0
+
+            # If Text & Image, place the image at the right side (or placeholder)
             if slide_format == "Text & Image":
                 img_bytes = st.session_state.get("slide_images", {}).get(idx)
                 if img_bytes:
@@ -623,30 +663,38 @@ def create_ppt(title, points, filename="output.pptx", title_size=30, text_size=2
                         shape.fill.solid()
                         shape.fill.fore_color.rgb = RGBColor(240, 240, 240)
                         shape.line.color.rgb = RGBColor(200, 200, 200)
-                        shape.text = "Image Placeholder"
+                        # some versions of python-pptx allow .text on shapes
+                        try:
+                            shape.text = "Image\nPlaceholder"
+                        except Exception:
+                            pass
                     except Exception:
                         pass
 
-        # Comparison layout
+        # ---------- Comparison layout (two columns) ----------
         elif slide_format == "Comparison":
-            # Try to infer topics from feedback or title stored in description if possible
-            # parse comparison block
+            # parse comparison content (robust parser should be available in module)
             left_title, left_bullets, right_title, right_bullets = parse_comparison_block(description or "")
 
-            # If parser returned generic 'Left'/'Right', attempt to infer from slide title
-            if left_title.lower() == "left" or right_title.lower() == "right":
+            # If titles are generic, try to infer from slide title
+            if (left_title.lower() == "left" or right_title.lower() == "right"):
                 a, b = infer_topics_from_title(key_point)
                 if a and b:
-                    left_title = left_title if left_title.lower() != "left" else a
-                    right_title = right_title if right_title.lower() != "right" else b
+                    if left_title.lower() == "left":
+                        left_title = a
+                    if right_title.lower() == "right":
+                        right_title = b
 
             # Left column title
             tb_left_title = slide.shapes.add_textbox(Inches(0.6), Inches(1.2), Inches(4.0), Inches(0.7))
             tf_lt = tb_left_title.text_frame
             try:
-                tf_lt.text = ""
+                tf_lt.clear()
             except Exception:
-                pass
+                try:
+                    tf_lt.text = ""
+                except Exception:
+                    pass
             p_lt = tf_lt.add_paragraph()
             p_lt.text = left_title
             p_lt.font.size = Pt(int(title_size * 0.9))
@@ -655,22 +703,28 @@ def create_ppt(title, points, filename="output.pptx", title_size=30, text_size=2
             p_lt.font.color.rgb = hex_to_rgb(title_color)
             p_lt.alignment = PP_ALIGN.LEFT
 
-            # Left bullets
+            # Left bullets (ensure visible dot)
             tb_left = slide.shapes.add_textbox(Inches(0.6), Inches(1.9), Inches(4.0), Inches(4.0))
             tf_left = tb_left.text_frame
             try:
-                tf_left.text = ""
+                tf_left.clear()
             except Exception:
-                pass
+                try:
+                    tf_left.text = ""
+                except Exception:
+                    pass
             tf_left.word_wrap = True
             if left_bullets:
                 for ln in left_bullets:
-                    p = tf_left.add_paragraph()
-                    p.text = f"• {ln}"
-                    p.font.size = Pt(text_size)
-                    p.font.name = font
-                    p.font.color.rgb = hex_to_rgb(text_color)
-                    p.level = 0
+                    for piece in split_long_line_into_bullets(ln, max_words=12):
+                        txt = piece.strip()
+                        display_text = txt if txt.startswith("•") else f"• {txt}"
+                        p = tf_left.add_paragraph()
+                        p.text = display_text
+                        p.font.size = Pt(text_size)
+                        p.font.name = font
+                        p.font.color.rgb = hex_to_rgb(text_color)
+                        p.level = 0
             else:
                 p = tf_left.add_paragraph()
                 p.text = "—"
@@ -682,9 +736,12 @@ def create_ppt(title, points, filename="output.pptx", title_size=30, text_size=2
             tb_right_title = slide.shapes.add_textbox(Inches(5.2), Inches(1.2), Inches(4.0), Inches(0.7))
             tf_rt = tb_right_title.text_frame
             try:
-                tf_rt.text = ""
+                tf_rt.clear()
             except Exception:
-                pass
+                try:
+                    tf_rt.text = ""
+                except Exception:
+                    pass
             p_rt = tf_rt.add_paragraph()
             p_rt.text = right_title
             p_rt.font.size = Pt(int(title_size * 0.9))
@@ -693,22 +750,28 @@ def create_ppt(title, points, filename="output.pptx", title_size=30, text_size=2
             p_rt.font.color.rgb = hex_to_rgb(title_color)
             p_rt.alignment = PP_ALIGN.LEFT
 
-            # Right bullets
+            # Right bullets (ensure visible dot)
             tb_right = slide.shapes.add_textbox(Inches(5.2), Inches(1.9), Inches(4.0), Inches(4.0))
             tf_right = tb_right.text_frame
             try:
-                tf_right.text = ""
+                tf_right.clear()
             except Exception:
-                pass
+                try:
+                    tf_right.text = ""
+                except Exception:
+                    pass
             tf_right.word_wrap = True
             if right_bullets:
                 for ln in right_bullets:
-                    p = tf_right.add_paragraph()
-                    p.text = f"• {ln}"
-                    p.font.size = Pt(text_size)
-                    p.font.name = font
-                    p.font.color.rgb = hex_to_rgb(text_color)
-                    p.level = 0
+                    for piece in split_long_line_into_bullets(ln, max_words=12):
+                        txt = piece.strip()
+                        display_text = txt if txt.startswith("•") else f"• {txt}"
+                        p = tf_right.add_paragraph()
+                        p.text = display_text
+                        p.font.size = Pt(text_size)
+                        p.font.name = font
+                        p.font.color.rgb = hex_to_rgb(text_color)
+                        p.level = 0
             else:
                 p = tf_right.add_paragraph()
                 p.text = "—"
@@ -716,13 +779,16 @@ def create_ppt(title, points, filename="output.pptx", title_size=30, text_size=2
                 p.font.name = font
                 p.font.color.rgb = hex_to_rgb(text_color)
 
-        # Footer
+        # ---------- Footer ----------
         tb_footer = slide.shapes.add_textbox(Inches(0.5), Inches(6.8), Inches(9), Inches(0.4))
         tf_footer = tb_footer.text_frame
         try:
-            tf_footer.text = ""
+            tf_footer.clear()
         except Exception:
-            pass
+            try:
+                tf_footer.text = ""
+            except Exception:
+                pass
         p_footer = tf_footer.add_paragraph()
         p_footer.text = "Generated with AI"
         p_footer.font.size = Pt(10)
@@ -732,6 +798,7 @@ def create_ppt(title, points, filename="output.pptx", title_size=30, text_size=2
 
     prs.save(filename)
     return filename
+
 
 # ---------------- STREAMLIT UI ----------------
 st.set_page_config(page_title="AI PPT Generator", layout="wide")
