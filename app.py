@@ -790,7 +790,7 @@ def create_ppt(title, points, filename="output.pptx", title_size=30, text_size=2
             except Exception:
                 pass
         p_footer = tf_footer.add_paragraph()
-        p_footer.text = "Generated with AI"
+        p_footer.text = title
         p_footer.font.size = Pt(10)
         p_footer.font.name = font
         p_footer.font.color.rgb = RGBColor(120, 120, 120)
