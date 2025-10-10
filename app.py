@@ -14,6 +14,7 @@ from pptx.util import Pt, Inches
 from pptx.dml.color import RGBColor
 from pptx.enum.text import PP_ALIGN
 from pptx.enum.shapes import MSO_SHAPE
+from datetime import date
 
 # ---------------- CONFIG ----------------
 # Replace this with an env var in production
@@ -579,6 +580,7 @@ def create_ppt(title, points, filename="output.pptx", title_size=30, text_size=2
         except Exception:
             pass
     p = tf.add_paragraph()
+    p.text = date.today().strftime("%Y-%m-%d")              
     p.text = title
     p.font.size = Pt(title_size)
     p.font.bold = True
