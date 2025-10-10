@@ -1057,7 +1057,7 @@ if st.session_state.outline_chat:
 
     col_apply, col_generate, col_clear = st.columns([1, 1, 1])
     with col_apply:
-        if st.button("🔄 Apply Feedback (outline-level)"):
+        if st.button("🔄 Apply Feedback"):
             with st.spinner("Updating outline..."):
                 updated = edit_outline_with_feedback(outline, outline_feedback)
                 if updated and updated.get("slides"):
