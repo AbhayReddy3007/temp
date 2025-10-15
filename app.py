@@ -320,6 +320,7 @@ def extract_text(path: str, filename: str) -> str:
 def extract_topics_from_feedback(feedback: str):
     """
     Attempt to extract two topics from feedback like:
+     - "differentiate A and B"
      - "compare A and B"
      - "A vs B"
      - "Compare A with B"
