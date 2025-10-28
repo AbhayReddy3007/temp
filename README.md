@@ -1,44 +1,46 @@
 """
-score_drugs_full_abstracts.py
+score_drugs_gemini25_flash.py
 
 - Reads an Excel with columns (case-insensitive): Name, published_date, abstract
 - Concatenates ALL abstracts per Name (sorted by published_date)
-- Sends the full concatenated text to Gemini for scoring (no summarization)
-- Applies exact MASH Resolution qualitative rules (user provided)
+- Sends the full concatenated text to Gemini 2.5 Flash (no summarization)
+- Applies exact MASH Resolution qualitative rules (as requested)
 - Uses numeric thresholds for other endpoints (configurable)
 - Saves results to an Excel file
 
-Requirements:
-    pip install pandas requests openpyxl
+USAGE:
+ - Replace GEMINI_API_KEY with your real key/token (hardcoded as requested).
+ - Ensure GEMINI_MODEL is "gemini-2.5-flash".
+ - Run: python score_drugs_gemini25_flash.py
 
-Notes:
-- This sends the full concatenated abstracts to the LLM. If your concatenated texts are extremely large,
-  your Gemini model may reject due to token limits. You explicitly requested "do not summarize",
-  so this script does not summarize or chunk — it will attempt the full text.
-- Adjust GEMINI endpoint/authentication if you use a different interface.
+SECURITY WARNING: Hardcoding secrets in source is insecure. Do not commit this file to a public repo.
 """
 
 import os
 import json
 import time
-import zipfile
-from typing import Dict, Any
+import re
+from typing import Dict
 import pandas as pd
 import requests
 
 # -----------------------
-# USER CONFIG
+# CONFIG (edit these)
 # -----------------------
-INPUT_EXCEL = "drugs_papers.xlsx"          # <-- change to your file path
-SHEET_NAME = None                          # None = auto-handle (single or multi-sheet)
-OUTPUT_EXCEL = "drug_scores_output_full.xlsx"
+INPUT_EXCEL = "drugs_papers.xlsx"          # path to your Excel file
+SHEET_NAME = None                          # None = auto-handle single or multi-sheet
+OUTPUT_EXCEL = "drug_scores_output_gemini25flash.xlsx"
 
-# Gemini API config: prefer storing API key in environment variable
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY")
-# Example model path — change to your model id / path if needed
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "models/gemini-1.0")
+# -----------------------
+# Gemini config - HARDCODED as requested
+# Replace the placeholder string with your real access token or API key.
+# If it's an OAuth2 access token (e.g., starts with "ya29."), the script will use Authorization: Bearer <token>.
+# If it's a Google API key (starts with "AIza"), the script will append ?key=<API_KEY> to the URL.
+# -----------------------
+GEMINI_API_KEY = "PASTE_YOUR_REAL_KEY_OR_ACCESS_TOKEN_HERE"
+GEMINI_MODEL = "gemini-2.5-flash"
 
-# Endpoints to score (exact strings used in prompt and output)
+# Endpoints to score (exact strings used in prompt & output)
 ENDPOINTS = [
     "Weight loss(%)",
     "A1c reduction(%)",
@@ -46,40 +48,29 @@ ENDPOINTS = [
     "ALT Reduction(%)"
 ]
 
-# Numeric thresholds for endpoints OTHER THAN MASH (edit as desired)
-# Format: { "<endpoint>": {5: value_for_5, 4: value_for_4, ... } }
+# Numeric thresholds for endpoints OTHER THAN MASH — modify to your desired cutoffs.
 thresholds: Dict[str, Dict[int, float]] = {
     "Weight loss(%)":   {5: 15.0, 4: 10.0, 3: 7.0, 2: 4.0, 1: 0.0},
     "A1c reduction(%)": {5: 1.5,  4: 1.0,  3: 0.7, 2: 0.4, 1: 0.0},
-    # MASH Resolution is handled qualitatively below (do not include thresholds for it)
     "ALT Reduction(%)": {5: 40.0, 4: 25.0, 3: 15.0, 2: 7.0, 1: 0.0},
 }
 MAX_SCORE = 20
 
 # -----------------------
-# Utilities: robust Excel reading
+# Helper: robust Excel reading (single or multi-sheet)
 # -----------------------
 def read_excel_flex(path: str, sheet_name=None, engine="openpyxl") -> pd.DataFrame:
-    """
-    Read an Excel workbook robustly:
-      - If sheet_name is None, handles single- or multi-sheet files.
-      - If multiple sheets exist, concatenates them (checks columns).
-    """
     if not os.path.exists(path):
         raise FileNotFoundError(f"File not found: {path}")
-
-    # If user provided explicit sheet name or index, pass it directly
     x = pd.read_excel(path, sheet_name=sheet_name, engine=engine)
-
     if isinstance(x, dict):
         n = len(x)
         if n == 0:
-            raise RuntimeError("Excel file has no sheets.")
+            raise RuntimeError("Excel file contains no sheets.")
         if n == 1:
             df = list(x.values())[0]
             print("Read workbook with 1 sheet.")
         else:
-            # decide how to concat: check whether columns are identical across sheets
             col_sets = [set([c.strip() if isinstance(c, str) else c for c in df.columns]) for df in x.values()]
             all_same = all(col_sets[0] == s for s in col_sets)
             if all_same:
@@ -91,84 +82,71 @@ def read_excel_flex(path: str, sheet_name=None, engine="openpyxl") -> pd.DataFra
     else:
         df = x
         print("Read single-sheet Excel (or sheet selected explicitly).")
-
-    # normalize column names (strip)
-    new_cols = []
-    for c in df.columns:
-        if isinstance(c, str):
-            new_cols.append(c.strip())
-        else:
-            new_cols.append(c)
-    df.columns = new_cols
+    # normalize column names
+    df.columns = [c.strip() if isinstance(c, str) else c for c in df.columns]
     return df
 
 # -----------------------
-# Normalize and validate columns (case-insensitive)
+# Map and validate required columns case-insensitively
 # -----------------------
-def map_required_columns(df: pd.DataFrame):
-    """
-    Ensure the DataFrame has Name, published_date, abstract columns (case-insensitive).
-    Returns a DataFrame with columns renamed to exactly: Name, published_date, abstract
-    """
-    col_map = {}
-    lower_to_col = { (c.lower() if isinstance(c, str) else c): c for c in df.columns }
-
-    def find_col(candidate_names):
-        for cand in candidate_names:
+def map_required_columns(df: pd.DataFrame) -> pd.DataFrame:
+    lower_map = { (c.lower() if isinstance(c, str) else c): c for c in df.columns }
+    def find_one(candidates):
+        for cand in candidates:
             key = cand.lower()
-            if key in lower_to_col:
-                return lower_to_col[key]
+            if key in lower_map:
+                return lower_map[key]
         return None
-
-    # possible variants for each required column
-    name_col = find_col(["name", "drug", "drug_name", "Name"])
-    date_col = find_col(["published_date", "publish_date", "date", "published", "publication_date"])
-    abstract_col = find_col(["abstract", "summary", "abstract_text", "Abstract"])
-
+    name_col = find_one(["name", "drug", "drug_name"])
+    date_col = find_one(["published_date", "publish_date", "date", "publication_date"])
+    abstract_col = find_one(["abstract", "summary", "abstract_text"])
     missing = []
-    if name_col is None:
-        missing.append("Name")
-    if date_col is None:
-        missing.append("published_date")
-    if abstract_col is None:
-        missing.append("abstract")
+    if name_col is None: missing.append("Name")
+    if date_col is None: missing.append("published_date")
+    if abstract_col is None: missing.append("abstract")
     if missing:
-        raise RuntimeError(f"Missing required column(s) in input file: {missing}. "
-                           "Ensure your file has Name, published_date, and abstract columns (case-insensitive).")
-
-    # rename to standardized names
+        raise RuntimeError(f"Missing required column(s): {missing}. Ensure the input has Name, published_date, and abstract (case-insensitive).")
     df = df.rename(columns={name_col: "Name", date_col: "published_date", abstract_col: "abstract"})
     return df
 
 # -----------------------
-# Gemini call (generic REST example)
+# Gemini call for gemini-2.5-flash (hardcoded-key friendly)
 # -----------------------
-def call_gemini(prompt: str, max_tokens: int = 1200, temperature: float = 0.0) -> str:
-    """
-    Call Gemini-like REST endpoint. Edit for your provider if needed.
-    Returns the model's text output.
-    """
-    if not GEMINI_API_KEY or GEMINI_API_KEY == "YOUR_GEMINI_API_KEY":
-        raise RuntimeError("Set GEMINI_API_KEY environment variable or update GEMINI_API_KEY in the script.")
-
-    # This URL pattern is illustrative. Replace if your deployment uses different path.
-    url = f"https://generativelanguage.googleapis.com/v1beta2/{GEMINI_MODEL}:generateText"
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {GEMINI_API_KEY}"
-    }
+def call_gemini(prompt: str, max_tokens: int = 1600, temperature: float = 0.0) -> str:
+    if not GEMINI_API_KEY or GEMINI_API_KEY.startswith("PASTE_YOUR"):
+        raise RuntimeError("GEMINI_API_KEY not set. Edit the script and paste your API key/token into GEMINI_API_KEY.")
+    model_id = GEMINI_MODEL or ""
+    if model_id.startswith("models/"):
+        model_id = model_id.split("models/", 1)[1]
+    base_url = f"https://generativelanguage.googleapis.com/v1beta2/models/{model_id}:generateText"
+    headers = {"Content-Type": "application/json"}
+    url = base_url
+    # Heuristic: Google API keys often start with 'AIza'
+    if GEMINI_API_KEY.startswith("AIza"):
+        url = base_url + f"?key={GEMINI_API_KEY}"
+    else:
+        headers["Authorization"] = f"Bearer {GEMINI_API_KEY}"
     body = {
         "prompt": {"text": prompt},
         "temperature": temperature,
         "maxOutputTokens": max_tokens
     }
-
-    resp = requests.post(url, headers=headers, json=body, timeout=180)
+    resp = requests.post(url, headers=headers, json=body, timeout=240)
     if resp.status_code != 200:
-        raise RuntimeError(f"Gemini API error {resp.status_code}: {resp.text}")
+        msg = (
+            f"Gemini call failed: status={resp.status_code}\n"
+            f"Request URL: {url}\n"
+            f"Model id used: {model_id}\n"
+            f"Response body:\n{resp.text}\n"
+        )
+        if resp.status_code == 404:
+            msg += (
+                "HTTP 404: resource not found. Check that GEMINI_MODEL is 'gemini-2.5-flash' "
+                "and that your key/token is valid and has access to this model."
+            )
+        raise RuntimeError(msg)
     data = resp.json()
-
-    # Try a few expected structures
+    # Extract common shapes
     if isinstance(data, dict):
         if "candidates" in data and isinstance(data["candidates"], list) and len(data["candidates"]) > 0:
             return data["candidates"][0].get("content", "")
@@ -180,14 +158,12 @@ def call_gemini(prompt: str, max_tokens: int = 1200, temperature: float = 0.0) -
                         pieces.append(content["text"])
             if pieces:
                 return "\n".join(pieces)
-    # fallback
     return json.dumps(data)
 
 # -----------------------
-# Build scoring prompt (strict: use only provided abstracts)
+# Prompt builder (strict MASH rules & "use only provided abstracts")
 # -----------------------
 def build_scoring_prompt(drug_name: str, combined_text: str, thresholds: Dict[str, Dict[int, float]]) -> str:
-    # Build numeric threshold lines for non-MASH endpoints
     thr_lines = []
     for ep in ENDPOINTS:
         if ep == "MASH Resolution(%)":
@@ -197,33 +173,32 @@ def build_scoring_prompt(drug_name: str, combined_text: str, thresholds: Dict[st
         mapping = thresholds[ep]
         thr_lines.append(f"{ep}: " + ", ".join([f"score {s} if inferred improvement >= {mapping[s]}" for s in sorted(mapping.keys(), reverse=True)]))
     thr_text = "\n".join(thr_lines)
-
-    # Exact MASH rules as requested
+    # MASH rules exactly as requested
     mash_rules = (
         "MASH Resolution qualitative scoring rules (apply these EXACTLY):\n"
-        " - 5: Evidence shows >=50% of patients achieved resolution with NO worsening of fibrosis.\n"
-        " - 4: Evidence shows >=30% of patients achieved resolution with NO worsening of fibrosis.\n"
-        " - 3: There is a resolution signal but some data indicates worsening of fibrosis in some patients.\n"
-        " - 2: Mixed or ambiguous data regarding resolution (conflicting findings, low-quality evidence, or inconsistent results).\n"
-        " - 1: No resolution observed in the provided abstracts.\n"
+        " - 5: >=50% of patients achieved resolution WITH NO worsening of fibrosis.\n"
+        " - 4: >=30% of patients achieved resolution WITH NO worsening of fibrosis.\n"
+        " - 3: Resolution signal but SOME data indicates worsening of fibrosis.\n"
+        " - 2: Mixed or ambiguous data on resolution.\n"
+        " - 1: No resolution observed.\n"
     )
-
     prompt = f"""
-You are an expert clinical researcher. YOU MUST ONLY use the text between -----BEGIN ABSTRACTS----- and -----END ABSTRACTS----- below.
-Do NOT use the web, external knowledge, or any information outside the provided abstracts. Use each and every abstract below; do NOT omit any study.
+You are a clinical research expert. YOU MUST ONLY USE THE TEXT BETWEEN -----BEGIN ABSTRACTS----- AND -----END ABSTRACTS----- BELOW.
+Do NOT use the web or any external knowledge. Use every abstract provided; do NOT omit or summarize any abstract.
 
 Drug: "{drug_name}"
 
-TASK:
-1) From the provided concatenated abstracts, extract evidence (and numeric estimates when present) for the following endpoints:
+TASKS:
+1) From the concatenated abstracts below, infer/extract numeric effect sizes or qualitative findings for these endpoints:
    {', '.join(ENDPOINTS)}
+
 2) Apply the MASH Resolution rules EXACTLY as specified:
 {mash_rules}
 
-3) For the other endpoints, apply these numeric thresholds STRICTLY:
+3) For the numeric endpoints, apply these thresholds STRICTLY:
 {thr_text}
 
-4) Output EXACTLY valid JSON (no extra commentary) with this schema:
+4) Output EXACTLY a single valid JSON object (no extra text) using this schema:
 {{
   "drug": "<drug name>",
   "scores": {{
@@ -232,30 +207,29 @@ TASK:
   }},
   "total_score": <0-20>,
   "max_score": {MAX_SCORE},
-  "confidence": <0.0-1.0>   // decimal indicating confidence based ONLY on provided abstracts
+  "confidence": <0.0-1.0>
 }}
 
 NOTES:
-- Each "reason" must be one short sentence referencing the abstracts (e.g., 'Study [2021-06-15] reported ~32% resolution; no fibrosis worsening reported').
-- If numeric percent is inferred for Weight/A1c/ALT, state the percent in the reason and apply numeric thresholds strictly.
-- If evidence is limited, still assign a score but set confidence lower and explain brevity in the reason.
-- The JSON object must be the only content in the model response.
+- Each "reason" must be one short sentence referencing the abstracts (e.g., 'Study [2021-06-15] reported ~32% resolution; no fibrosis worsening noted').
+- If you infer a numeric percent for Weight/A1c/ALT, state the percent in the reason and apply numeric thresholds strictly.
+- If evidence is limited, still assign a score but set confidence lower and explain in the reason.
+- The JSON object must be the only content in the response.
 
 -----BEGIN ABSTRACTS-----
 {combined_text}
 -----END ABSTRACTS-----
 """
+    # trim leading/trailing whitespace and return
     return prompt.strip()
 
 # -----------------------
-# Robust JSON extraction helper
+# JSON extraction helper (resilient)
 # -----------------------
 def extract_json_from_text(text: str):
-    """Try to extract a JSON object substring from a text blob and parse it."""
     try:
         return json.loads(text)
     except Exception:
-        # find the first '{' and the last '}' and try parsing that slice
         start = text.find("{")
         end = text.rfind("}")
         if start != -1 and end != -1 and end > start:
@@ -263,9 +237,7 @@ def extract_json_from_text(text: str):
             try:
                 return json.loads(candidate)
             except Exception:
-                # last-ditch: try to fix common LLM mistakes (replace single quotes, remove trailing commas)
                 cand2 = candidate.replace("'", '"')
-                import re
                 cand2 = re.sub(r",\s*}", "}", cand2)
                 cand2 = re.sub(r",\s*]", "]", cand2)
                 try:
@@ -278,23 +250,16 @@ def extract_json_from_text(text: str):
 # Main pipeline
 # -----------------------
 def main():
-    print("Reading input Excel:", INPUT_EXCEL)
+    print("Reading input:", INPUT_EXCEL)
     df = read_excel_flex(INPUT_EXCEL, sheet_name=SHEET_NAME)
     df = map_required_columns(df)
-
-    # ensure published_date parsed
     df["published_date"] = pd.to_datetime(df["published_date"], errors="coerce")
-
-    # drop rows missing Name or abstract
     before_n = len(df)
     df = df.dropna(subset=["Name", "abstract"])
     after_n = len(df)
     if after_n < before_n:
         print(f"Dropped {before_n - after_n} rows missing Name or abstract.")
-
-    # sort by published_date then group by Name
     grouped = df.sort_values("published_date").groupby("Name", sort=True)
-
     combined_per_drug = {}
     for name, group in grouped:
         parts = []
@@ -305,44 +270,29 @@ def main():
             parts.append(f"[{date_str}] {row['abstract']}")
         combined_text = "\n\n---\n\n".join(parts)
         combined_per_drug[name] = combined_text
-
-    print(f"Found {len(combined_per_drug)} unique drugs. Beginning model scoring (this may take a while).")
+    print(f"Found {len(combined_per_drug)} unique drugs. Beginning scoring...")
 
     results = []
     for drug, combined_text in combined_per_drug.items():
-        print(f"\nScoring drug: {drug}  (chars: {len(combined_text)})")
-        # Build prompt (send full concatenated abstracts)
+        print(f"\nScoring: {drug} (chars={len(combined_text)})")
         prompt = build_scoring_prompt(drug, combined_text, thresholds)
-
-        # Call Gemini with small retry loop
         raw_out = None
         for attempt in range(3):
             try:
-                raw_out = call_gemini(prompt, max_tokens=1600, temperature=0.0)
+                raw_out = call_gemini(prompt, max_tokens=2000, temperature=0.0)
                 break
             except Exception as e:
                 print(f"  Gemini call failed (attempt {attempt+1}): {e}")
                 time.sleep(1 + attempt)
         if raw_out is None:
-            print(f"  ERROR: failed to get response from Gemini for {drug}. Saving error placeholder.")
-            results.append({
-                "drug": drug,
-                "error": "Gemini call failed after retries",
-                "raw_output": None
-            })
+            print(f"  ERROR: failed to get response for {drug}. Storing error placeholder.")
+            results.append({"drug": drug, "error": "Gemini call failed after retries", "raw_output": None})
             continue
-
-        # Try to parse JSON
         parsed = extract_json_from_text(raw_out)
         if parsed is None:
-            print("  Warning: Could not parse JSON directly from model output. Storing raw output for manual inspection.")
-            parsed = {
-                "drug": drug,
-                "raw_output": raw_out,
-                "parse_error": True
-            }
+            print("  Warning: Could not parse JSON from model output. Storing raw output for inspection.")
+            parsed = {"drug": drug, "raw_output": raw_out, "parse_error": True}
         else:
-            # ensure total present: if not, compute from endpoint scores if possible
             if parsed.get("total_score") is None:
                 s = 0
                 ok = True
@@ -358,15 +308,12 @@ def main():
                 if ok:
                     parsed["total_score"] = s
             parsed.setdefault("max_score", MAX_SCORE)
-
         parsed["_char_len"] = len(combined_text)
         parsed["_raw_output"] = raw_out
         results.append(parsed)
-
-        # courteous pause (avoid hammering the API)
         time.sleep(0.35)
 
-    # Build output DataFrame
+    # Flatten results to DataFrame
     rows = []
     for r in results:
         if not isinstance(r, dict):
@@ -385,11 +332,9 @@ def main():
             base[f"{ep} - score"] = ep_obj.get("score")
             base[f"{ep} - reason"] = ep_obj.get("reason")
         rows.append(base)
-
     out_df = pd.DataFrame(rows)
     out_df.to_excel(OUTPUT_EXCEL, index=False)
     print(f"\nDone. Results saved to: {OUTPUT_EXCEL}")
 
 if __name__ == "__main__":
     main()
-
