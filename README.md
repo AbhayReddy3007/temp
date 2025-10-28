@@ -1,38 +1,43 @@
 """
-gemini_drug_scoring.py
+gemini_drug_scoring_full_abstracts.py
+
+- Reads an Excel with columns: Name, published_date, abstract
+- Combines ALL abstracts per drug (no summarization / no omission)
+- Sends full concatenated abstracts to Gemini with strict instructions:
+    * Use only the provided abstracts (no web)
+    * Follow the MASH Resolution qualitative rules exactly
+    * Apply numeric thresholds for other endpoints (user-provided)
+    * Return EXACTLY valid JSON (schema described)
+- Saves results to an output Excel.
 
 Requirements:
-- pandas
-- requests
-- openpyxl (for pandas to read/write Excel)
+pip install pandas requests openpyxl
 
-Install: pip install pandas requests openpyxl
+Usage:
+- Edit INPUT_EXCEL and thresholds below
+- Set GEMINI_API_KEY and GEMINI_MODEL in environment, or edit the variables
+- Run: python gemini_drug_scoring_full_abstracts.py
 """
 
 import os
 import json
-import math
 import time
-import requests
+from typing import Dict
 import pandas as pd
-from typing import Dict, Any, List
+import requests
 
 # -----------------------
 # USER CONFIG
 # -----------------------
-INPUT_EXCEL = "drugs_papers.xlsx"   # path to your Excel
-SHEET_NAME = None                   # or sheet name if needed
-OUTPUT_EXCEL = "drug_scores_output.xlsx"
+INPUT_EXCEL = "drugs_papers.xlsx"    # your input file
+SHEET_NAME = None                    # if needed
+OUTPUT_EXCEL = "drug_scores_output_full_abstracts.xlsx"
 
-# Gemini API config (set as environment variables for safety)
+# Gemini API config - set env vars or replace here (not recommended)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "models/gemini-1.0")  # change to your model id
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "models/gemini-1.0")  # adjust per your account
 
-# Local limits used to decide whether to summarize first
-CHARS_SUMMARY_THRESHOLD = 18000   # if concatenated abstracts exceed this, summarize first
-CHUNK_CHARS = 8000                # when summarizing, chunk size to feed the model
-
-# endpoints to score (exact names used later in prompt)
+# endpoints (must match exactly in prompt & output)
 ENDPOINTS = [
     "Weight loss(%)",
     "A1c reduction(%)",
@@ -40,296 +45,223 @@ ENDPOINTS = [
     "ALT Reduction(%)"
 ]
 
-# Example thresholds: YOU SHOULD EDIT THESE to your exact "when to give 5/4/3/2/1"
-# numeric meaning: minimum % (or absolute) improvement required for that score
-# Keys must match ENDPOINTS strings exactly.
+# Numeric thresholds for endpoints OTHER THAN MASH (edit to your desired cutoffs).
+# Keys must match ENDPOINTS exactly, but MASH is handled qualitatively and ignored here.
 thresholds: Dict[str, Dict[int, float]] = {
     "Weight loss(%)":     {5: 15.0, 4: 10.0, 3: 7.0, 2: 4.0, 1: 0.0},
     "A1c reduction(%)":   {5: 1.5,  4: 1.0,  3: 0.7, 2: 0.4, 1: 0.0},
-    "MASH Resolution(%)": {5: 60.0, 4: 45.0, 3: 30.0,2: 15.0,1: 0.0},
-    "ALT Reduction(%)":   {5: 40.0, 4: 25.0, 3: 15.0,2: 7.0, 1: 0.0}
+    # MASH Resolution is handled by qualitative rules — do not include thresholds here for it
+    "ALT Reduction(%)":   {5: 40.0, 4: 25.0, 3: 15.0, 2: 7.0, 1: 0.0}
 }
 MAX_SCORE = 20
 
-
 # -----------------------
-# Helper: Gemini call
+# Gemini call (simple REST example)
+# Adjust if your Gemini usage differs (client library, different URL, auth)
 # -----------------------
 def call_gemini(prompt: str, max_tokens: int = 1200, temperature: float = 0.0) -> str:
-    """
-    Call Gemini (Generative Language) REST API (example).
-    Adjust endpoint/model name if your provider is different.
-    Returns the model's text output (string).
-    NOTE: This example uses the v1beta2 generateText endpoint style.
-    """
     if GEMINI_API_KEY is None or GEMINI_API_KEY == "YOUR_GEMINI_API_KEY":
-        raise RuntimeError("Please set GEMINI_API_KEY environment variable or update GEMINI_API_KEY in the script.")
-
-    # Example Google Generative API endpoint (may require different auth depending on your setup)
-    # If you use a cloud client or a different endpoint, replace this block with the proper call.
+        raise RuntimeError("Set GEMINI_API_KEY environment variable or update GEMINI_API_KEY in script.")
     url = f"https://generativelanguage.googleapis.com/v1beta2/{GEMINI_MODEL}:generateText"
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {GEMINI_API_KEY}"
     }
     body = {
-        "prompt": {
-            "text": prompt
-        },
+        "prompt": {"text": prompt},
         "temperature": temperature,
         "maxOutputTokens": max_tokens
     }
-
-    resp = requests.post(url, headers=headers, json=body, timeout=120)
+    resp = requests.post(url, headers=headers, json=body, timeout=180)
     if resp.status_code != 200:
         raise RuntimeError(f"Gemini API error {resp.status_code}: {resp.text}")
     data = resp.json()
-    # structure depends on API; try a couple of known patterns
+    # common shapes handled:
     if "candidates" in data and isinstance(data["candidates"], list):
         return data["candidates"][0].get("content", "")
     if "output" in data and isinstance(data["output"], list):
-        # Some responses place text under output[0].content[0].text
         pieces = []
         for item in data["output"]:
-            if "content" in item and isinstance(item["content"], list):
-                for c in item["content"]:
-                    if "text" in c:
-                        pieces.append(c["text"])
+            for c in item.get("content", []):
+                if "text" in c:
+                    pieces.append(c["text"])
         return "\n".join(pieces)
-    # fallback: stringify entire json
-    return json.dumps(data, indent=2)
-
+    return json.dumps(data)
 
 # -----------------------
-# Helper: summarizer (simple two-step)
-# -----------------------
-def summarize_long_text(long_text: str) -> str:
-    """
-    If text is too long, chunk and ask the model to summarize each chunk,
-    then combine chunk summaries and ask for a final concise summary.
-    Returns the final summary string.
-    """
-    # naive chunking by characters
-    chunks = [long_text[i:i+CHUNK_CHARS] for i in range(0, len(long_text), CHUNK_CHARS)]
-    chunk_summaries = []
-    for i, ch in enumerate(chunks):
-        prompt = (
-            f"You are an expert scientific summarizer. Produce a concise (3-5 sentence) summary of this chunk "
-            f"keeping key study results, effect sizes, and any numerical endpoints. Output only the summary.\n\n"
-            f"Chunk {i+1}/{len(chunks)}:\n\n{ch}"
-        )
-        # small token budget for chunk summary
-        text = call_gemini(prompt, max_tokens=400, temperature=0.0)
-        chunk_summaries.append(text.strip())
-        time.sleep(0.35)  # mild rate-limit spacing
-
-    combined = "\n\n".join(chunk_summaries)
-    final_prompt = (
-        "You are an expert scientific summarizer. Combine the following chunk summaries into one coherent "
-        "concise summary (max 8 sentences). Keep numeric outcomes and effect sizes, include study count if possible.\n\n"
-        f"{combined}"
-    )
-    final_summary = call_gemini(final_prompt, max_tokens=600, temperature=0.0)
-    return final_summary.strip()
-
-
-# -----------------------
-# Build scoring prompt
+# Build prompt (explicit MASH rules + "use every abstract" directive)
 # -----------------------
 def build_scoring_prompt(drug_name: str, combined_text: str, thresholds: Dict[str, Dict[int, float]]) -> str:
-    """
-    Build a deterministic prompt instructing the LLM to:
-      - apply thresholds
-      - return machine-readable JSON
-      - include per-endpoint short justification
-      - include total score and confidence
-    """
+    # Build numeric threshold lines for non-MASH endpoints
     thr_lines = []
     for ep in ENDPOINTS:
+        if ep == "MASH Resolution(%)":
+            continue
         if ep not in thresholds:
             raise ValueError(f"Thresholds missing for endpoint: {ep}")
         mapping = thresholds[ep]
-        thr_lines.append(f"{ep}: " + ", ".join([f"score {s} if >= {mapping[s]}" for s in sorted(mapping.keys(), reverse=True)]))
-
+        thr_lines.append(f"{ep}: " + ", ".join([f"score {s} if inferred improvement >= {mapping[s]}" for s in sorted(mapping.keys(), reverse=True)]))
     thr_text = "\n".join(thr_lines)
 
-    prompt = f"""
-You are a clinical research expert. Below are concatenated abstracts and metadata for the drug "{drug_name}" (many papers).
-Your tasks:
-1) From the text below, infer expected evidence-based approximate numeric effect sizes and/or qualitative evidence for each of these endpoints:
-   {', '.join(ENDPOINTS)}.
-   You may state numbers (e.g., "weight loss ~12% (pooled from four RCTs)") if supported by the abstracts, or give best-effort estimates with explanation if exact numbers are not present.
+    mash_rules = (
+        "MASH Resolution qualitative scoring rules (apply these EXACTLY):\n"
+        " - 5: Evidence shows >=50% of patients achieved NASH resolution WITH NO worsening of fibrosis.\n"
+        " - 4: Evidence shows >=30% of patients achieved NASH resolution WITH NO worsening of fibrosis.\n"
+        " - 3: There is a resolution signal but some data indicates worsening of fibrosis in some patients.\n"
+        " - 2: Mixed or ambiguous data regarding resolution (conflicting findings, low-quality evidence, or inconsistent results).\n"
+        " - 1: No resolution observed in the provided abstracts."
+    )
 
-2) Using the following scoring thresholds, assign a score 1-5 for each endpoint.
+    prompt = f"""
+You are a clinical research expert. You WILL ONLY use the text between -----BEGIN ABSTRACTS----- and -----END ABSTRACTS----- below to draw conclusions.
+Do NOT use the web, any external sources, or your world knowledge beyond what is present in the abstracts. Use each and every abstract provided — do NOT omit any abstract or make assumptions based on outside knowledge.
+
+Drug: "{drug_name}"
+
+TASKS:
+1) From the concatenated abstracts below, extract evidence and (where present) approximate numeric effect sizes or descriptive findings for each of these endpoints:
+   {', '.join(ENDPOINTS)}.
+   For each endpoint, the model should base conclusions only on the text provided and must cite brief supporting text from the abstracts in the "reason" (one short sentence).
+2) APPLY the MASH Resolution qualitative rules exactly (below).
+{mash_rules}
+
+3) For the other endpoints, use the numeric scoring thresholds provided here:
 {thr_text}
 
-3) Output EXACTLY valid JSON (no extra text) with the following schema:
+4) Return EXACTLY valid JSON (no extra text) in the schema:
 {{
   "drug": "<drug name>",
   "scores": {{
-    "<endpoint name>": {{ "score": <1-5>, "reason": "<one-sentence justification, include numbers if available>" }},
+    "<endpoint name>": {{ "score": <1-5>, "reason": "<one-sentence justification drawn from the abstracts>" }},
     ...
   }},
   "total_score": <0-20>,
   "max_score": 20,
-  "confidence": <0.0-1.0>   // decimal expressing how confident you are about the scoring
+  "confidence": <0.0-1.0>    // decimal expressing model's confidence based only on the material provided
 }}
 
-Notes:
-- Apply the thresholds strictly: choose the highest score whose threshold is satisfied by the evidence/inferred numeric value.
-- If evidence is insufficient to estimate a numeric improvement, you may still assign a score but set confidence lower and explain in the "reason".
-- Keep each reason brief (1 sentence).
-- DO NOT include any text outside the JSON object.
+NOTES & RULES:
+- Use only the provided abstracts. Do NOT search the web or rely on external facts.
+- Use each abstract's content to support statements; include a short textual cue in each reason like: "Study X: [YYYY-MM-DD] reported ..." or quote short fragment (<=20 words) from the abstracts if present.
+- For numeric endpoints (Weight loss, A1c, ALT), if you infer a numeric percent, state the inferred percent in the reason and apply the numeric thresholds strictly (choose highest score whose threshold is satisfied).
+- For MASH Resolution, obey the qualitative rules above (choose the one that best matches the evidence).
+- If evidence is limited or ambiguous for an endpoint, still assign a score but set confidence lower and explain why in the reason.
+- The JSON output must be the only text in the response.
 
-Now analyze the following concatenated abstracts (start of text below). Use only the information in the text to score; if you need to make reasonable inferences, note them explicitly in the reason.
 -----BEGIN ABSTRACTS-----
 {combined_text}
 -----END ABSTRACTS-----
 """
     return prompt.strip()
 
-
 # -----------------------
-# Main pipeline
+# Main pipeline (no summarization; uses full concatenated abstracts)
 # -----------------------
 def main():
-    # 1. Read Excel and select columns
+    # 1. Read Excel
     df = pd.read_excel(INPUT_EXCEL, sheet_name=SHEET_NAME, engine="openpyxl")
-    # keep only relevant columns
     df = df.rename(columns={c: c.strip() for c in df.columns})
-    assert "Name" in df.columns and "abstract" in df.columns and "published_date" in df.columns, \
-        "Excel must contain columns: Name, published_date, abstract"
-
-    # coerce published_date to datetime for sorting
+    required = {"Name", "published_date", "abstract"}
+    if not required.issubset(set(df.columns)):
+        raise RuntimeError(f"Input must contain columns: {required}")
     df["published_date"] = pd.to_datetime(df["published_date"], errors="coerce")
-    # drop rows with missing Name or abstract
     df = df.dropna(subset=["Name", "abstract"])
 
-    # 2. Group by drug name and combine abstracts (sorted by published_date ascending)
+    # 2. Combine all abstracts per drug (sorted by date)
     grouped = df.sort_values("published_date").groupby("Name", sort=True)
     combined_per_drug = {}
     for name, group in grouped:
-        abstracts = []
+        parts = []
         for _, row in group.iterrows():
             date_str = ""
             if pd.notna(row["published_date"]):
                 date_str = str(row["published_date"].date())
-            abstract_text = f"[{date_str}] {row['abstract']}"
-            abstracts.append(abstract_text)
-        combined_text = "\n\n---\n\n".join(abstracts)
+            parts.append(f"[{date_str}] {row['abstract']}")
+        combined_text = "\n\n---\n\n".join(parts)
         combined_per_drug[name] = combined_text
 
-    # 3. For each drug: summarize if too long -> build scoring prompt -> call Gemini -> parse JSON
     results = []
     for drug, combined_text in combined_per_drug.items():
-        print(f"\nProcessing drug: {drug}  (chars: {len(combined_text)})")
-
-        # If very long, summarize first to keep prompt manageable
-        if len(combined_text) > CHARS_SUMMARY_THRESHOLD:
-            print("  -> Long text detected; summarizing before scoring...")
-            try:
-                summary = summarize_long_text(combined_text)
-                text_for_model = summary + "\n\n[Original concatenated abstracts omitted for brevity]"
-            except Exception as e:
-                print("  Summarization failed:", e)
-                text_for_model = combined_text[:CHUNK_CHARS]  # fallback to partial text
-        else:
-            text_for_model = combined_text
-
-        prompt = build_scoring_prompt(drug, text_for_model, thresholds)
-
-        # call gemini; allow simple retries
-        attempt = 0
+        print(f"Processing: {drug}  (chars={len(combined_text)})")
+        # build prompt (we intentionally send the full combined_text)
+        prompt = build_scoring_prompt(drug, combined_text, thresholds)
+        # call Gemini (retry small number of times)
         raw_out = None
-        while attempt < 3:
+        for attempt in range(3):
             try:
-                raw_out = call_gemini(prompt, max_tokens=800, temperature=0.0)
+                raw_out = call_gemini(prompt, max_tokens=1200, temperature=0.0)
                 break
             except Exception as e:
-                attempt += 1
-                print(f"  Gemini call failed (attempt {attempt}): {e}")
-                time.sleep(1.0 + attempt * 1.0)
+                print(f"  Gemini call failed (attempt {attempt+1}): {e}")
+                time.sleep(1 + attempt * 1.0)
         if raw_out is None:
-            print(f"  Failed to get model output for {drug}; skipping.")
+            print(f"  Failed for {drug}; saving error.")
+            results.append({
+                "drug": drug,
+                "error": "Gemini call failed after retries",
+                "raw_output": None
+            })
             continue
 
-        # model is instructed to output only JSON; try to parse it
+        # Try parsing JSON (model was asked to output JSON only)
         parsed = None
         try:
             parsed = json.loads(raw_out)
         except Exception:
-            # sometimes model returns code fences or extra text; try to find the JSON substring
+            # try to extract JSON substring
             try:
                 start = raw_out.find("{")
                 end = raw_out.rfind("}") + 1
-                json_text = raw_out[start:end]
-                parsed = json.loads(json_text)
-            except Exception as e:
-                print("  Failed to parse JSON from model output. Raw output:\n", raw_out)
-                # record raw text for manual inspection
-                parsed = {
-                    "drug": drug,
-                    "scores": {},
-                    "total_score": None,
-                    "max_score": MAX_SCORE,
-                    "confidence": None,
-                    "raw_output": raw_out
-                }
+                parsed = json.loads(raw_out[start:end])
+            except Exception:
+                parsed = {"drug": drug, "raw_output": raw_out, "parse_error": True}
 
-        # post-process to ensure numeric total exists; if not compute sum
-        if isinstance(parsed, dict):
-            if parsed.get("total_score") is None:
-                # compute sum of numeric endpoint scores
-                s = 0
-                missing = False
-                for ep in ENDPOINTS:
-                    sc_obj = parsed.get("scores", {}).get(ep)
-                    if isinstance(sc_obj, dict):
-                        sc = sc_obj.get("score")
-                        if isinstance(sc, (int, float)):
-                            s += int(sc)
-                        else:
-                            missing = True
-                    else:
-                        missing = True
-                if not missing:
-                    parsed["total_score"] = s
+        # If total_score missing, compute from endpoint scores if possible
+        if isinstance(parsed, dict) and parsed.get("total_score") is None:
+            total = 0
+            ok = True
+            for ep in ENDPOINTS:
+                sc = None
+                try:
+                    sc = parsed.get("scores", {}).get(ep, {}).get("score")
+                except Exception:
+                    sc = None
+                if isinstance(sc, (int, float)):
+                    total += int(sc)
                 else:
-                    parsed["total_score"] = parsed.get("total_score")  # keep None if can't compute
+                    ok = False
+            if ok:
+                parsed["total_score"] = total
+            else:
+                parsed["total_score"] = parsed.get("total_score")  # keep as-is (maybe None)
 
-            parsed["max_score"] = parsed.get("max_score", MAX_SCORE)
-            # attach the combined length for traceability
-            parsed["_char_len"] = len(combined_text)
-
+        parsed["_char_len"] = len(combined_text)
         results.append(parsed)
+        time.sleep(0.35)
 
-        # gentle pause to respect rate limits
-        time.sleep(0.4)
-
-    # 4. Save results to Excel
-    # normalize results to table rows: one row per drug, plus nested score details as string
+    # 4. Flatten results to dataframe and save
     rows = []
     for r in results:
         if not isinstance(r, dict):
             continue
-        row = {
+        base = {
             "drug": r.get("drug"),
             "total_score": r.get("total_score"),
-            "max_score": r.get("max_score"),
+            "max_score": r.get("max_score", MAX_SCORE),
             "confidence": r.get("confidence"),
-            "raw_output": r.get("raw_output", ""),
-            "_char_len": r.get("_char_len", None),
+            "_char_len": r.get("_char_len"),
+            "raw_output": r.get("raw_output", "") or (r if isinstance(r, str) else "")
         }
-        scores = r.get("scores", {})
+        scores = r.get("scores", {}) if isinstance(r.get("scores"), dict) else {}
         for ep in ENDPOINTS:
-            ep_obj = scores.get(ep, {})
-            row[f"{ep} - score"] = ep_obj.get("score") if isinstance(ep_obj, dict) else None
-            row[f"{ep} - reason"] = ep_obj.get("reason") if isinstance(ep_obj, dict) else None
-        rows.append(row)
+            ep_obj = scores.get(ep, {}) or {}
+            base[f"{ep} - score"] = ep_obj.get("score")
+            base[f"{ep} - reason"] = ep_obj.get("reason")
+        rows.append(base)
+
     out_df = pd.DataFrame(rows)
     out_df.to_excel(OUTPUT_EXCEL, index=False)
     print(f"\nDone. Results saved to {OUTPUT_EXCEL}")
-
 
 if __name__ == "__main__":
     main()
