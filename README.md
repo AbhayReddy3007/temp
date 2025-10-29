@@ -1,211 +1,186 @@
-# extract_outcomes_with_gemini.py
+# extract_outcomes_gemini.py
 """
+Usage:
+    python extract_outcomes_gemini.py /path/to/abstracts.csv
+
 Requirements:
-  pip install google-genai pandas
+    pip install google-genai pandas tqdm
+    # or: pip install git+https://github.com/googleapis/python-genai.git
 Notes:
-  - Recommended: set GEMINI_API_KEY as an environment variable.
-  - If you really want to hardcode the API key, set API_KEY below (not recommended publicly).
-References:
-  Gemini docs / examples: see Google GenAI / Vertex docs for gemini-2.5-flash usage.
-  (Example usage patterns used while building this script). 
+    - The library will pick your API key from environment variable GEMINI_API_KEY.
+      If you prefer to hardcode the key, set API_KEY variable below (not recommended for shared machines).
 """
 
-import os
+import sys
 import json
-import re
 import time
 import pandas as pd
+from tqdm import tqdm
 
-# Option A (recommended): from env var
-API_KEY = os.environ.get("GEMINI_API_KEY")
+# --------- CONFIG ----------
+# Option A (recommended): set GEMINI_API_KEY as environment variable
+# export GEMINI_API_KEY="YOUR_API_KEY"
+#
+# Option B (if you insisted on hardcoding): set API_KEY below (not recommended)
+API_KEY = None  # <-- replace with "ya29..." or your API key string ONLY IF you understand the risk
 
-# Option B (less secure) - uncomment to hardcode (only for local testing)
-# API_KEY = "your_real_gemini_api_key_here"
+MODEL_NAME = "gemini-2.5-flash"
+OUTPUT_CSV = "abstracts_with_outcomes.csv"
+SLEEP_BETWEEN_REQUESTS = 0.35  # seconds; gentle pacing
+MAX_ROWS = None  # set to integer for quick tests, or None to process all
 
-if not API_KEY:
-    raise RuntimeError("No GEMINI_API_KEY found. Set GEMINI_API_KEY env var or hardcode API_KEY in script.")
-
-# Import the official client
+# --------- Gemini client init ----------
 try:
     from google import genai
 except Exception as e:
-    raise RuntimeError("Please install google-genai package: pip install google-genai") from e
-
-def build_prompt(abstract_text):
-    """
-    Prompt instructs the model to output only JSON (no extra commentary).
-    The model should return numeric percent values (float or int) for percentages,
-    'yes'/'no'/'unknown' for resolution fields, and include a short supporting excerpt.
-    """
-    return f"""
-You are a careful scientific extractor. Given the following research abstract, extract EXACTLY the following JSON object and nothing else:
-
-{{
-  "weight_loss_pct": <number or null>,         # % weight loss reported (as a number), or null if not reported
-  "a1c_reduction_pct": <number or null>,       # % A1c reduction reported, or null
-  "mash_resolution": <"yes"|"no"|"unknown">,    # whether MASH (NASH with metabolic dysfunction) resolved/remitted
-  "alt_resolution": <"yes"|"no"|"unknown">,     # whether ALT (alanine aminotransferase) normalized/resolved
-  "confidence": "<brief confidence estimate>", # short (e.g., 'high', 'low', or a short note)
-  "supporting_text": "<short excerpt from the abstract used to justify>" 
-}}
-
-Rules:
-- Return valid JSON only. Do NOT include explanations or extra text.
-- Percent values must be numeric (e.g., 12.5). If abstract says 'no change' or doesn't report, use null.
-- For resolution fields, use "yes" only if the abstract explicitly states resolution/normalization or provides clear numeric evidence; use "no" if it explicitly says not resolved; otherwise "unknown".
-- Keep supporting_text short (<= 50 words), copy verbatim fragment that supports your extraction.
-
-Abstract:
-\"\"\"{abstract_text}\"\"\"
-"""
-
-def call_gemini(prompt, model="gemini-2.5-flash"):
-    """
-    Make a synchronous generate_content call to Gemini.
-    This example uses the official genai client. Behavior may vary slightly by SDK version.
-    """
-    client = genai.Client(api_key=API_KEY)
-
-    # Generate content. Adjust model ID if your account uses a different one.
-    response = client.models.generate_content(
-        model=model,
-        contents=[prompt],
-        # You can adjust temperature, max tokens etc. via config if SDK/version supports it.
+    raise SystemExit(
+        "Missing google-genai library. Install with:\n    pip install google-genai\n"
     )
 
-    # Extract text from the candidate parts (SDK returns parts; choose first candidate)
-    # This extraction mirrors typical responses: candidates[0].content.parts
-    text_parts = []
+if API_KEY:
+    client = genai.Client(api_key=API_KEY)
+else:
+    client = genai.Client()  # will read GEMINI_API_KEY env var if set
+
+# --------- prompt template ----------
+PROMPT_TEMPLATE = """
+You are a precise extractor. Given the abstract of a clinical / research paper, extract the following four outcomes if they are reported in the abstract. Output EXACTLY one valid JSON object (single-line) with these four keys:
+
+1) weight_loss_pct -> numeric percent (e.g., 12.5) if the abstract reports a percentage of weight loss; otherwise null.
+2) a1c_reduction_pct -> numeric percent (e.g., 1.2) if the abstract reports an A1c reduction percentage; otherwise null.
+   - If A1c reduction is reported as absolute change in % (e.g., "A1c decreased from 8.5% to 7.3%"), compute the percent point change (8.5 -> 7.3 -> 1.2) and return 1.2.
+   - If A1c is reported as relative percent reduction only (e.g., "10% relative reduction"), return 10.
+3) mash_resolution -> one of "yes", "no", or "unclear". "yes" if the abstract explicitly states MASH (or NASH/MASH) resolved or showed resolution; "no" if explicitly states no resolution; "unclear" if not reported or ambiguous.
+4) alt_resolution -> one of "yes", "no", or "unclear". "yes" if the abstract explicitly states ALT normalized or resolved; "no" if explicitly states not resolved; "unclear" otherwise.
+
+Example output:
+{"weight_loss_pct": 12.5, "a1c_reduction_pct": 1.2, "mash_resolution": "yes", "alt_resolution": "unclear"}
+
+Now extract from this abstract (do not add any extra text, commentary, or explanation — only the JSON object):
+
+-----
+{abstract_here}
+-----
+"""
+
+# --------- helper: parse model response ----------
+def parse_json_from_response(resp_text):
+    """
+    Attempt to parse JSON from the model output text.
+    If not parseable, return None.
+    """
     try:
-        candidate = response.candidates[0]
-        for part in candidate.content.parts:
-            if getattr(part, "text", None):
-                text_parts.append(part.text)
+        # model should output a single-line JSON; but tolerate if there's surrounding whitespace
+        text = resp_text.strip()
+        # sometimes model wraps JSON in backticks or code fences; remove them
+        if text.startswith("```"):
+            # find last ```
+            parts = text.split("```")
+            for p in parts[::-1]:
+                p = p.strip()
+                if p.startswith("{") and p.endswith("}"):
+                    text = p
+                    break
+        # find first { and last } to extract JSON substring
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            json_text = text[start:end+1]
+            data = json.loads(json_text)
+            return data
+        else:
+            # try direct json loads
+            return json.loads(text)
     except Exception:
-        # fallback to simpler attribute names if SDK differs
+        return None
+
+# --------- main ----------
+def main(csv_path):
+    df = pd.read_csv(csv_path)
+    if "abstract" not in df.columns:
+        raise SystemExit("CSV must contain a column named 'abstract' (lowercase).")
+    if MAX_ROWS:
+        df = df.head(MAX_ROWS)
+
+    # prepare result columns
+    df["weight_loss_pct"] = None
+    df["a1c_reduction_pct"] = None
+    df["mash_resolution"] = None
+    df["alt_resolution"] = None
+    df["gemini_raw"] = None
+
+    # iterate rows
+    for idx, row in tqdm(df.iterrows(), total=len(df), desc="Processing"):
+        abstract = str(row["abstract"])
+        prompt = PROMPT_TEMPLATE.replace("{abstract_here}", abstract)
+
         try:
-            text_parts.append(response.text)
-        except Exception:
-            raise RuntimeError("Unexpected response format from Gemini client; inspect `response` object.")
-    return "\n".join(text_parts).strip()
+            response = client.models.generate_content(
+                model=MODEL_NAME,
+                contents=prompt
+            )
+            # many client responses expose .text convenience; otherwise inspect candidates
+            resp_text = ""
+            if hasattr(response, "text") and response.text:
+                resp_text = response.text
+            else:
+                # try to safely pull first candidate text
+                try:
+                    parts = response.candidates[0].content.parts
+                    # concatenate text parts
+                    resp_text = "".join([p.text for p in parts if p.text])
+                except Exception:
+                    resp_text = str(response)
 
-# Fallback local regex extraction if model doesn't return JSON
-def fallback_extract(abstract):
-    res = {
-        "weight_loss_pct": None,
-        "a1c_reduction_pct": None,
-        "mash_resolution": "unknown",
-        "alt_resolution": "unknown",
-        "confidence": "fallback_regex",
-        "supporting_text": ""
-    }
+            df.at[idx, "gemini_raw"] = resp_text
 
-    # find percent-like numbers
-    pct_matches = re.findall(r'([0-9]+(?:\.[0-9]+)?)\s*%|\b([0-9]+(?:\.[0-9]+)?)\s*percent', abstract, flags=re.I)
-    # flatten matches
-    flat = []
-    for a,b in pct_matches:
-        flat.append(a or b)
-    # naive heuristics: first percent referencing weight or BMI -> weight_loss; A1c often "A1c" or "HbA1c"
-    # find weight loss phrases
-    weight_match = re.search(r'(weight (?:loss|reduction)[^\d\n\r]{0,40}([0-9]+(?:\.[0-9]+)?)[\s%]|lost\s([0-9]+(?:\.[0-9]+)?)\s%?)', abstract, flags=re.I)
-    if weight_match:
-        num = weight_match.group(2) or weight_match.group(3)
-        try:
-            res["weight_loss_pct"] = float(num)
-            res["supporting_text"] += f"weight phrase: {weight_match.group(0)} "
-        except:
-            pass
+            parsed = parse_json_from_response(resp_text)
+            if parsed is None:
+                # fallback: store raw and set unclear/null
+                df.at[idx, "weight_loss_pct"] = None
+                df.at[idx, "a1c_reduction_pct"] = None
+                df.at[idx, "mash_resolution"] = "unclear"
+                df.at[idx, "alt_resolution"] = "unclear"
+            else:
+                # normalize parsed values
+                def norm_num(v):
+                    if v is None: return None
+                    try:
+                        return float(v)
+                    except Exception:
+                        return None
+                df.at[idx, "weight_loss_pct"] = norm_num(parsed.get("weight_loss_pct"))
+                df.at[idx, "a1c_reduction_pct"] = norm_num(parsed.get("a1c_reduction_pct"))
+                df.at[idx, "mash_resolution"] = parsed.get("mash_resolution") if parsed.get("mash_resolution") in ("yes","no","unclear") else "unclear"
+                df.at[idx, "alt_resolution"] = parsed.get("alt_resolution") if parsed.get("alt_resolution") in ("yes","no","unclear") else "unclear"
 
-    # A1c
-    a1c_match = re.search(r'(A1c|HbA1c)[^\d\n\r]{0,40}([0-9]+(?:\.[0-9]+)?)\s*%?', abstract, flags=re.I)
-    if a1c_match:
-        try:
-            res["a1c_reduction_pct"] = float(a1c_match.group(2))
-            res["supporting_text"] += f"A1c phrase: {a1c_match.group(0)} "
-        except:
-            pass
-
-    # MASH/NASH resolution heuristics
-    if re.search(r'\b(resolv(ed|tion)|remission|remitted|resolved)\b', abstract, flags=re.I) and re.search(r'(MASH|NASH)', abstract, flags=re.I):
-        res["mash_resolution"] = "yes"
-        res["supporting_text"] += "MASH/NASH resolution phrase found. "
-    elif re.search(r'(MASH|NASH)', abstract, flags=re.I):
-        res["mash_resolution"] = "unknown"
-
-    # ALT normalization
-    if re.search(r'(ALT|alanine aminotransferase)[^\n]{0,80}\b(normaliz|normaliz|resolved|within normal)\b', abstract, flags=re.I):
-        res["alt_resolution"] = "yes"
-        res["supporting_text"] += "ALT normalization phrase found. "
-    elif re.search(r'(ALT|alanine aminotransferase)', abstract, flags=re.I):
-        res["alt_resolution"] = "unknown"
-
-    return res
-
-def parse_model_json(text):
-    """
-    Try to load JSON from the model's output. The model is instructed to produce JSON only.
-    """
-    # Trim anything before first { and after last } to be robust
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1:
-        raise ValueError("No JSON object detected")
-    json_text = text[start:end+1]
-    # Some models include trailing commas / comments - try to fix trivial issues
-    json_text = re.sub(r",\s*}", "}", json_text)
-    json_text = re.sub(r",\s*]", "]", json_text)
-    return json.loads(json_text)
-
-def process_csv(input_csv="abstracts.csv", output_csv="abstracts_with_outcomes.csv", model="gemini-2.5-flash"):
-    df = pd.read_csv(input_csv)
-    if 'abstract' not in df.columns:
-        raise RuntimeError("CSV must contain a column named 'abstract'")
-
-    results = []
-    for idx, row in df.iterrows():
-        abstract = str(row['abstract'])
-        prompt = build_prompt(abstract)
-
-        # call model, with simple retry
-        try:
-            raw = call_gemini(prompt, model=model)
         except Exception as e:
-            print(f"[{idx}] Gemini call failed: {e}. Falling back to local regex.")
-            parsed = fallback_extract(abstract)
-            parsed['model_raw'] = ""
-            results.append(parsed)
-            time.sleep(0.2)
-            continue
+            # on error: save the error text and mark unclear
+            df.at[idx, "gemini_raw"] = f"ERROR: {e}"
+            df.at[idx, "mash_resolution"] = "unclear"
+            df.at[idx, "alt_resolution"] = "unclear"
 
-        # Try parsing JSON
-        parsed = None
-        try:
-            parsed_json = parse_model_json(raw)
-            # Normalize fields
-            parsed = {
-                "weight_loss_pct": parsed_json.get("weight_loss_pct"),
-                "a1c_reduction_pct": parsed_json.get("a1c_reduction_pct"),
-                "mash_resolution": parsed_json.get("mash_resolution"),
-                "alt_resolution": parsed_json.get("alt_resolution"),
-                "confidence": parsed_json.get("confidence"),
-                "supporting_text": parsed_json.get("supporting_text"),
-                "model_raw": raw
-            }
-        except Exception as e:
-            # fallback to regex heuristics
-            print(f"[{idx}] Failed to parse JSON from model output: {e}. Attempting regex fallback.")
-            parsed = fallback_extract(abstract)
-            parsed['model_raw'] = raw
+        time.sleep(SLEEP_BETWEEN_REQUESTS)
 
-        results.append(parsed)
-        # polite pacing
-        time.sleep(0.1)
+    # save results
+    df.to_csv(OUTPUT_CSV, index=False)
+    # print summary
+    total = len(df)
+    wl_count = df["weight_loss_pct"].notnull().sum()
+    a1c_count = df["a1c_reduction_pct"].notnull().sum()
+    mash_yes = (df["mash_resolution"] == "yes").sum()
+    alt_yes = (df["alt_resolution"] == "yes").sum()
 
-    out_df = pd.concat([df.reset_index(drop=True), pd.DataFrame(results)], axis=1)
-    out_df.to_csv(output_csv, index=False)
-    print(f"Done. Saved to {output_csv}")
+    print(f"\nProcessed {total} abstracts.")
+    print(f"Weight-loss % extracted for {wl_count} abstracts.")
+    print(f"A1c reduction % extracted for {a1c_count} abstracts.")
+    print(f"MASH resolution reported as 'yes' in {mash_yes} abstracts.")
+    print(f"ALT resolution reported as 'yes' in {alt_yes} abstracts.")
+    print(f"Results saved to: {OUTPUT_CSV}")
 
 if __name__ == "__main__":
-    # If you want to change input/output filenames or model id, edit below
-    process_csv(input_csv="abstracts.csv", output_csv="abstracts_with_outcomes.csv", model="gemini-2.5-flash")
+    if len(sys.argv) < 2:
+        print("Usage: python extract_outcomes_gemini.py /path/to/abstracts.csv")
+        sys.exit(1)
+    csv_path = sys.argv[1]
+    main(csv_path)
